@@ -67,6 +67,19 @@ Sources
    from_tcp
    from_http_server
 
+Checkpointing
+-------------
+
+.. currentmodule:: streamz.checkpoint
+
+.. autosummary::
+   save_checkpoint
+   restore_checkpoint
+   register_function
+   registered_functions
+
+.. currentmodule:: streamz
+
 DaskStream
 ----------
 

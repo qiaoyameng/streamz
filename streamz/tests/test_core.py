@@ -1728,6 +1728,140 @@ def test_accumulate_errors_raises():
         a.emit(0)
 
 
+def test_changelog_accumulate_sum():
+    source = Stream()
+    node = source.changelog_accumulate(add=lambda acc, v: acc + v,
+                                       retract=lambda acc, v: acc - v,
+                                       start=0)
+    L = node.sink_to_list()
+
+    source.emit(('a', 1, 10, 'add'))
+    source.emit(('a', 2, 20, 'add'))
+    source.emit(('b', 1, 5, 'add'))
+    assert L == [('a', 10), ('a', 30), ('b', 5)]
+
+    # duplicate addition is ignored
+    source.emit(('a', 1, 10, 'add'))
+    assert L == [('a', 10), ('a', 30), ('b', 5)]
+
+    # correction: retract the stale contribution, add the new one
+    source.emit(('a', 1, 10, 'remove'))
+    source.emit(('a', 3, 15, 'add'))
+    assert L[-2:] == [('a', 20), ('a', 35)]
+
+    # retracting an unknown event is ignored
+    source.emit(('a', 99, 1, 'remove'))
+    assert L[-1] == ('a', 35)
+
+    # clearing the group emits an explicit deletion signal
+    source.emit(('a', 2, 20, 'remove'))
+    source.emit(('a', 3, 15, 'remove'))
+    assert L[-2:] == [('a', 15), sz.core.GroupDeleted('a')]
+    assert 'a' not in node.states and 'a' not in node.events
+
+    # the other group is unaffected
+    source.emit(('b', 2, 7, 'add'))
+    assert L[-1] == ('b', 12)
+
+
+def test_changelog_accumulate_count():
+    source = Stream()
+    L = source.changelog_accumulate(add=lambda acc, v: acc + 1,
+                                    retract=lambda acc, v: acc - 1,
+                                    start=0).sink_to_list()
+
+    source.emit(('a', 1, None, 'add'))
+    source.emit(('a', 2, None, 'add'))
+    source.emit(('a', 1, None, 'add'))  # duplicate, ignored
+    assert L == [('a', 1), ('a', 2)]
+
+    source.emit(('a', 1, None, 'remove'))
+    source.emit(('a', 2, None, 'remove'))
+    assert L[-2:] == [('a', 1), sz.core.GroupDeleted('a')]
+
+
+def test_changelog_accumulate_conflicting_id():
+    source = Stream()
+    L = source.changelog_accumulate(add=lambda acc, v: acc + v,
+                                    retract=lambda acc, v: acc - v,
+                                    start=0).sink_to_list()
+    source.emit(('a', 1, 10, 'add'))
+
+    # same id with a different value is a conflict, not a correction
+    with pytest.raises(ValueError):
+        source.emit(('a', 1, 99, 'add'))
+    with pytest.raises(ValueError):
+        source.emit(('a', 1, 99, 'remove'))
+
+    # failed events left no state behind
+    source.emit(('a', 1, 10, 'remove'))
+    assert L == [('a', 10), sz.core.GroupDeleted('a')]
+
+
+def test_changelog_accumulate_failed_reduction_is_atomic():
+    def add(acc, v):
+        if v == 13:
+            raise RuntimeError('boom')
+        return acc + v
+
+    source = Stream()
+    node = source.changelog_accumulate(add=add,
+                                       retract=lambda acc, v: acc - v,
+                                       start=0)
+    L = node.sink_to_list()
+
+    source.emit(('a', 1, 10, 'add'))
+    with pytest.raises(RuntimeError):
+        source.emit(('a', 2, 13, 'add'))
+
+    # the failed addition is not half-recorded: it can be retracted like any
+    # other unknown event and does not corrupt the accumulator
+    assert list(node.events['a']) == [1]
+    assert node.states == {'a': 10}
+    source.emit(('a', 3, 5, 'add'))
+    source.emit(('a', 1, 10, 'remove'))
+    assert L == [('a', 10), ('a', 15), ('a', 5)]
+
+
+def test_changelog_accumulate_metadata_lifecycle():
+    source = Stream()
+    node = source.changelog_accumulate(add=lambda acc, v: acc + v,
+                                       retract=lambda acc, v: acc - v,
+                                       start=0)
+    L = node.sink_to_list()  # noqa: F841
+
+    r1, r2, r3 = RefCounter(), RefCounter(), RefCounter()
+    source.emit(('a', 1, 10, 'add'), metadata=[{'ref': r1}])
+    source.emit(('a', 2, 20, 'add'), metadata=[{'ref': r2}])
+    # live events hold their metadata
+    assert (r1.count, r2.count) == (1, 1)
+
+    # duplicates and unknown retractions do not retain anything
+    source.emit(('a', 1, 10, 'add'), metadata=[{'ref': r3}])
+    assert r3.count == 0
+    source.emit(('a', 99, 1, 'remove'), metadata=[{'ref': r3}])
+    assert r3.count == 0
+
+    # retracting an event releases exactly its own metadata
+    source.emit(('a', 1, 10, 'remove'))
+    assert (r1.count, r2.count) == (0, 1)
+
+    # emptying the group releases the last reference
+    source.emit(('a', 2, 20, 'remove'))
+    assert (r1.count, r2.count) == (0, 0)
+
+
+def test_changelog_accumulate_bad_event():
+    source = Stream()
+    source.changelog_accumulate(add=lambda acc, v: acc + v,
+                                retract=lambda acc, v: acc - v,
+                                start=0).sink_to_list()
+    with pytest.raises(ValueError):
+        source.emit(('a', 1, 10))
+    with pytest.raises(ValueError):
+        source.emit(('a', 1, 10, 'update'))
+
+
 @gen_test()
 def test_sync_in_event_loop():
     a = Stream()

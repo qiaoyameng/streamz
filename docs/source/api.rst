@@ -16,6 +16,7 @@ Stream
    Stream.visualize
    accumulate
    buffer
+   changelog_accumulate
    collect
    combine_latest
    delay
@@ -84,6 +85,7 @@ Definitions
 
 .. autofunction:: accumulate
 .. autofunction:: buffer
+.. autofunction:: changelog_accumulate
 .. autofunction:: collect
 .. autofunction:: combine_latest
 .. autofunction:: delay

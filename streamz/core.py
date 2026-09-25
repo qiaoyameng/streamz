@@ -1,6 +1,6 @@
 import asyncio
 import concurrent.futures
-from collections import deque, defaultdict
+from collections import deque, defaultdict, namedtuple
 from datetime import timedelta
 from itertools import chain
 import functools
@@ -1024,6 +1024,192 @@ class accumulate(Stream):
                 return self._emit((self.state, result), metadata=metadata)
             else:
                 return self._emit(result, metadata=metadata)
+
+
+class GroupDeleted(object):
+    """ Signal that the last event of a key group was retracted
+
+    Emitted by ``changelog_accumulate`` downstream when a key has no live
+    events left and its group state has been deleted.
+
+    Parameters
+    ----------
+    key: Hashable
+        The key of the deleted group
+    """
+    def __init__(self, key):
+        self.key = key
+
+    def __eq__(self, other):
+        return type(other) is type(self) and other.key == self.key
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __repr__(self):
+        return 'GroupDeleted(%r)' % (self.key,)
+
+
+ChangelogEvent = namedtuple('ChangelogEvent', ['key', 'id', 'value', 'op'])
+
+
+@Stream.register_api()
+class changelog_accumulate(Stream):
+    """ Aggregate a changelog of additions and retractions per key
+
+    Upstreams may correct data they have already emitted, which a one-way
+    ``accumulate`` cannot undo.  This operator consumes changelog events of
+    the form ``(key, id, value, op)`` where ``id`` is a stable event
+    identifier and ``op`` is ``'add'`` or ``'remove'`` (``True``/``False``
+    are also accepted).  It maintains one aggregation per key and emits the
+    latest aggregate ``(key, result)`` after every accepted event.
+
+    The caller provides the two reduction functions; the operator is
+    responsible for changelog bookkeeping:
+
+    - duplicate additions of the same event id are ignored
+    - retractions of unknown event ids are ignored
+    - the same id arriving with a different value raises ``ValueError``
+    - when the last event of a key is retracted the group is deleted and a
+      ``GroupDeleted`` signal is emitted downstream
+
+    Reductions are applied atomically: if ``add`` or ``retract`` raises, the
+    group state is left untouched.  Metadata references of accepted events
+    are retained for exactly as long as the event is live in the state and
+    released when it is retracted.
+
+    Parameters
+    ----------
+    add: callable
+        ``add(accumulator, value) -> new accumulator`` for additions
+    retract: callable
+        ``retract(accumulator, value) -> new accumulator`` for retractions
+    start: object
+        Initial accumulator for a new group, passed as ``accumulator`` to
+        the first ``add``.  Defaults to the value of the first added event.
+
+    Examples
+    --------
+    A running sum per key that supports corrections
+
+    >>> source = Stream()
+    >>> _ = source.changelog_accumulate(add=lambda acc, v: acc + v,
+    ...                                 retract=lambda acc, v: acc - v,
+    ...                                 start=0).sink(print)
+    >>> source.emit(('a', 1, 10, 'add'))
+    ('a', 10)
+    >>> source.emit(('a', 1, 10, 'add'))  # duplicate addition, ignored
+    >>> source.emit(('a', 2, 20, 'add'))
+    ('a', 30)
+    >>> source.emit(('a', 1, 10, 'remove'))  # retract a stale contribution
+    ('a', 20)
+    >>> source.emit(('a', 3, 15, 'add'))  # corrected value under a new id
+    ('a', 35)
+    >>> source.emit(('a', 2, 20, 'remove'))
+    ('a', 15)
+    >>> source.emit(('a', 3, 15, 'remove'))  # last member leaves the group
+    GroupDeleted('a')
+
+    A count of live events per key
+
+    >>> source = Stream()
+    >>> _ = source.changelog_accumulate(add=lambda acc, v: acc + 1,
+    ...                                 retract=lambda acc, v: acc - 1,
+    ...                                 start=0).sink(print)
+    >>> source.emit(('a', 1, None, 'add'))
+    ('a', 1)
+    >>> source.emit(('a', 2, None, 'add'))
+    ('a', 2)
+    >>> source.emit(('a', 1, None, 'remove'))
+    ('a', 1)
+    """
+    _graphviz_shape = 'box'
+
+    def __init__(self, upstream, add, retract, start=no_default, **kwargs):
+        self.add = add
+        self.retract = retract
+        self.start = start
+        self.states = {}  # key -> accumulator
+        self.events = {}  # key -> {event id: (value, metadata)}
+        stream_name = kwargs.pop('stream_name', None)
+        Stream.__init__(self, upstream, stream_name=stream_name)
+
+    @staticmethod
+    def _normalize(x):
+        try:
+            key, event_id, value, op = x
+        except (TypeError, ValueError):
+            raise ValueError(
+                "changelog_accumulate expects (key, id, value, op) events, "
+                "got %r" % (x,))
+        if op is True:
+            op = 'add'
+        elif op is False:
+            op = 'remove'
+        if op not in ('add', 'remove'):
+            raise ValueError(
+                "Unknown changelog operation %r, expected 'add' or 'remove'"
+                % (op,))
+        return key, event_id, value, op
+
+    def update(self, x, who=None, metadata=None):
+        key, event_id, value, op = self._normalize(x)
+        if op == 'add':
+            return self._add(key, event_id, value, metadata)
+        else:
+            return self._remove(key, event_id, value, metadata)
+
+    def _add(self, key, event_id, value, metadata):
+        events = self.events.get(key)
+        if events is not None and event_id in events:
+            old_value = events[event_id][0]
+            if old_value != value:
+                raise ValueError(
+                    "Conflicting values for event id %r of key %r: "
+                    "%r != %r" % (event_id, key, old_value, value))
+            logger.warning("Ignoring duplicate addition of event %r "
+                           "for key %r", event_id, key)
+            return
+        if events:
+            acc = self.add(self.states[key], value)
+        elif self.start is no_default:
+            acc = value
+        else:
+            acc = self.add(self.start, value)
+        # commit only after the reduction has succeeded
+        if events is None:
+            events = self.events[key] = {}
+        events[event_id] = (value, metadata)
+        self.states[key] = acc
+        if metadata:
+            self._retain_refs(metadata)
+        return self._emit((key, acc), metadata=metadata)
+
+    def _remove(self, key, event_id, value, metadata):
+        events = self.events.get(key)
+        if events is None or event_id not in events:
+            logger.warning("Ignoring retraction of unknown event %r "
+                           "for key %r", event_id, key)
+            return
+        old_value, old_metadata = events[event_id]
+        if old_value != value:
+            raise ValueError(
+                "Conflicting values for event id %r of key %r: "
+                "%r != %r" % (event_id, key, old_value, value))
+        acc = self.retract(self.states[key], value)
+        # commit only after the reduction has succeeded
+        del events[event_id]
+        if old_metadata:
+            self._release_refs(old_metadata)
+        if not events:
+            del self.events[key]
+            del self.states[key]
+            return self._emit(GroupDeleted(key), metadata=metadata)
+        self.states[key] = acc
+        return self._emit((key, acc), metadata=metadata)
 
 
 @Stream.register_api()

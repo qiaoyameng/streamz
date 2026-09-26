@@ -4,6 +4,7 @@ import weakref
 from tornado import gen
 
 from streamz import Stream
+from streamz.checkpoint import CheckpointBarrier
 from streamz.core import sync
 
 # sinks add themselves here to avoid being garbage-collected
@@ -66,6 +67,11 @@ class sink(Sink):
         super().__init__(upstream, **stream_kwargs)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            # Checkpoint barriers are control messages, not data; sinks do
+            # not forward them to user functions.  Exactly-once delivery to
+            # external sinks is out of scope for checkpointing.
+            return []
         result = self.func(x, *self.args, **self.kwargs)
         if gen.isawaitable(result):
             return result

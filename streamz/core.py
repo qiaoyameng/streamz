@@ -25,6 +25,11 @@ from collections.abc import Iterable
 
 from threading import get_ident as get_thread_identity
 from .orderedweakset import OrderedWeakrefSet
+from .checkpoint import (
+    CheckpointBarrier,
+    CheckpointError,
+    register_function as _register_checkpoint_function,
+)
 
 no_default = '--no-default--'
 
@@ -63,6 +68,9 @@ def get_io_loop(asynchronous=None):
 
 def identity(x):
     return x
+
+
+_register_checkpoint_function(identity, name="streamz.identity")
 
 
 class RefCounter:
@@ -240,6 +248,12 @@ class Stream(APIRegisterMixin):
     _graphviz_orientation = 0
 
     str_list = ['func', 'predicate', 'n', 'interval']
+
+    # Version of the serialized operator state, recorded in checkpoints
+    _state_version = 1
+    # Names of attributes holding user functions, recorded by registered
+    # name in checkpoints (see streamz.checkpoint)
+    _checkpoint_func_attrs = ()
 
     def __init__(self, upstream=None, upstreams=None, stream_name=None,
                  loop=None, asynchronous=None, ensure_io_loop=False):
@@ -503,6 +517,23 @@ class Stream(APIRegisterMixin):
     def update(self, x, who=None, metadata=None):
         return self._emit(x, metadata=metadata)
 
+    def _checkpoint_state(self):
+        """ Return a picklable snapshot of this node's state, or None
+
+        This is called by ``streamz.checkpoint.Checkpointer`` after a
+        checkpoint barrier has flowed through the graph.  Stateless nodes
+        return None.
+        """
+        return None
+
+    def _restore_state(self, state):
+        """ Restore a snapshot previously produced by ``_checkpoint_state`` """
+        raise CheckpointError(
+            "{} does not support checkpointed state".format(
+                type(self).__name__
+            )
+        )
+
     def gather(self):
         """ This is a no-op for core streamz
 
@@ -700,6 +731,8 @@ class map(Stream):
     6
     8
     """
+    _checkpoint_func_attrs = ('func',)
+
     def __init__(self, upstream, func, *args, **kwargs):
         self.func = func
         # this is one of a few stream specific kwargs
@@ -710,6 +743,8 @@ class map(Stream):
         Stream.__init__(self, upstream, stream_name=stream_name)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._emit(x, metadata=metadata)
         try:
             result = self.func(x, *self.args, **self.kwargs)
         except Exception as e:
@@ -861,6 +896,8 @@ class starmap(Stream):
     6
     8
     """
+    _checkpoint_func_attrs = ('func',)
+
     def __init__(self, upstream, func, *args, **kwargs):
         self.func = func
         # this is one of a few stream specific kwargs
@@ -871,6 +908,8 @@ class starmap(Stream):
         Stream.__init__(self, upstream, stream_name=stream_name)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._emit(x, metadata=metadata)
         y = x + self.args
         try:
             result = self.func(*y, **self.kwargs)
@@ -883,6 +922,9 @@ class starmap(Stream):
 
 def _truthy(x):
     return not not x
+
+
+_register_checkpoint_function(_truthy, name="streamz._truthy")
 
 
 @Stream.register_api()
@@ -909,6 +951,7 @@ class filter(Stream):
     2
     4
     """
+    _checkpoint_func_attrs = ('predicate',)
 
     def __init__(self, upstream, predicate, *args, **kwargs):
         if predicate is None:
@@ -921,6 +964,8 @@ class filter(Stream):
         Stream.__init__(self, upstream, stream_name=stream_name)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._emit(x, metadata=metadata)
         if self.predicate(x, *self.args, **self.kwargs):
             return self._emit(x, metadata=metadata)
 
@@ -990,6 +1035,7 @@ class accumulate(Stream):
     (2, 0)
     """
     _graphviz_shape = 'box'
+    _checkpoint_func_attrs = ('func',)
 
     def __init__(self, upstream, func, start=no_default, returns_state=False,
                  **kwargs):
@@ -1003,6 +1049,8 @@ class accumulate(Stream):
         Stream.__init__(self, upstream, stream_name=stream_name)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._emit(x, metadata=metadata)
         if self.state is no_default:
             self.state = x
             if self.with_state:
@@ -1024,6 +1072,17 @@ class accumulate(Stream):
                 return self._emit((self.state, result), metadata=metadata)
             else:
                 return self._emit(result, metadata=metadata)
+
+    def _checkpoint_state(self):
+        if self.state is no_default:
+            return {'has_state': False, 'state': None}
+        return {'has_state': True, 'state': self.state}
+
+    def _restore_state(self, state):
+        if state['has_state']:
+            self.state = state['state']
+        else:
+            self.state = no_default
 
 
 @Stream.register_api()
@@ -1118,6 +1177,7 @@ class partition(Stream):
     (0, 1, 2)
     """
     _graphviz_shape = 'diamond'
+    _checkpoint_func_attrs = ('_key',)
 
     def __init__(self, upstream, n, timeout=None, key=None, **kwargs):
         self.n = n
@@ -1126,7 +1186,9 @@ class partition(Stream):
         self._buffer = defaultdict(lambda: [])
         self._metadata_buffer = defaultdict(lambda: [])
         self._callbacks = {}
-        kwargs["ensure_io_loop"] = True
+        # An IO loop is only needed to schedule timeout flushes; without a
+        # timeout the operator is fully synchronous.
+        kwargs["ensure_io_loop"] = timeout is not None
         Stream.__init__(self, upstream, **kwargs)
 
     def _get_key(self, x):
@@ -1136,15 +1198,20 @@ class partition(Stream):
             return self._key(x)
         return x[self._key]
 
-    @gen.coroutine
     def _flush(self, key):
         result, self._buffer[key] = self._buffer[key], []
         metadata_result, self._metadata_buffer[key] = self._metadata_buffer[key], []
-        yield self._emit(tuple(result), list(metadata_result))
+        emitted = self._emit(tuple(result), list(metadata_result))
         self._release_refs(metadata_result)
+        return emitted
 
     @gen.coroutine
+    def _flush_async(self, key):
+        yield self._flush(key)
+
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._emit(x)
         self._retain_refs(metadata)
         key = self._get_key(x)
         buffer = self._buffer[key]
@@ -1157,12 +1224,24 @@ class partition(Stream):
         if len(buffer) == self.n:
             if self._timeout is not None and self.n > 1:
                 self._callbacks[key].cancel()
-            yield self._flush(key)
-            return
+            return self._flush(key)
         if len(buffer) == 1 and self._timeout is not None:
             self._callbacks[key] = self.loop.call_later(
-                self._timeout, self._flush, key
+                self._timeout, self._flush_async, key
             )
+
+    def _checkpoint_state(self):
+        return {
+            'buffers': {key: list(values)
+                        for key, values in self._buffer.items()},
+        }
+
+    def _restore_state(self, state):
+        self._buffer = defaultdict(
+            lambda: [],
+            {key: list(values) for key, values in state['buffers'].items()},
+        )
+        self._metadata_buffer = defaultdict(lambda: [])
 
 
 @Stream.register_api()
@@ -1630,23 +1709,92 @@ class zip(Stream):
         return tuple(out)
 
     def update(self, x, who=None, metadata=None):
+        if isinstance(x, CheckpointBarrier):
+            return self._update_barrier(x, who)
         self._retain_refs(metadata)
         L = self.buffers[who]  # get buffer for stream
         L.append((x, metadata))
-        if len(L) == 1 and all(self.buffers.values()):
-            vals = [self.buffers[up][0] for up in self.upstreams]
-            tup, md = __builtins__['zip'](*vals)
-            for buf in self.buffers.values():
-                buf.popleft()
-            self.condition.notify_all()
-            if self.literals:
-                tup = self.pack_literals(tup)
-            md = [m for ml in md for m in ml]
-            ret = self._emit(tup, md)
-            self._release_refs(md)
-            return ret
+        if all(buffer and not isinstance(buffer[0], CheckpointBarrier)
+               for buffer in self.buffers.values()):
+            return self._pair_heads()
         elif len(L) > self.maxsize:
             return self.condition.wait()
+
+    def _pair_heads(self):
+        vals = [self.buffers[up][0] for up in self.upstreams]
+        tup, md = __builtins__['zip'](*vals)
+        for buf in self.buffers.values():
+            buf.popleft()
+        self.condition.notify_all()
+        if self.literals:
+            tup = self.pack_literals(tup)
+        md = [m for ml in md for m in ml]
+        ret = self._emit(tup, md)
+        self._release_refs(md)
+        return ret
+
+    def _update_barrier(self, barrier, who):
+        buffer = self.buffers[who]
+        if any(isinstance(item, CheckpointBarrier) and
+               item.checkpoint_id == barrier.checkpoint_id
+               for item in buffer):
+            return  # this input has already seen the barrier
+        # The barrier marker blocks this buffer: data queued behind it
+        # belongs to the next epoch and must not be paired with data from
+        # before the barrier on the other inputs.
+        buffer.append(barrier)
+        aligned = all(
+            any(isinstance(item, CheckpointBarrier) for item in buf)
+            for buf in self.buffers.values()
+        )
+        if not aligned:
+            return
+        ids = {item.checkpoint_id
+               for buf in self.buffers.values()
+               for item in buf
+               if isinstance(item, CheckpointBarrier)}
+        if ids != {barrier.checkpoint_id}:
+            raise CheckpointError(
+                "Misaligned checkpoint barriers at zip operator: "
+                "expected id {}, found {}".format(
+                    barrier.checkpoint_id, sorted(ids)
+                )
+            )
+        for buf in self.buffers.values():
+            marker = next(item for item in buf
+                          if isinstance(item, CheckpointBarrier))
+            buf.remove(marker)
+        results = self._emit(barrier)
+        # Data that arrived behind the barriers may now be pairable
+        while all(buf and not isinstance(buf[0], CheckpointBarrier)
+                  for buf in self.buffers.values()):
+            r = self._pair_heads()
+            if type(r) is list:
+                results.extend(r)
+            elif r is not None:
+                results.append(r)
+        return results
+
+    def _checkpoint_state(self):
+        return {
+            'buffers': [
+                [item[0] for item in self.buffers[up]
+                 if not isinstance(item, CheckpointBarrier)]
+                for up in self.upstreams
+            ],
+        }
+
+    def _restore_state(self, state):
+        buffers = state['buffers']
+        if len(buffers) != len(self.upstreams):
+            raise CheckpointError(
+                "Checkpoint state has {} input buffers but this zip has "
+                "{} upstreams".format(len(buffers), len(self.upstreams))
+            )
+        for i, upstream in enumerate(self.upstreams):
+            self.buffers[upstream] = deque(
+                (value, []) for value in buffers[i]
+            )
 
 
 @Stream.register_api()

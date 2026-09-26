@@ -76,6 +76,18 @@ DaskStream
    DaskStream
    gather
 
+Checkpointing
+-------------
+
+.. currentmodule:: streamz.checkpoint
+
+.. autosummary::
+   Checkpointer
+   CheckpointBarrier
+   CheckpointError
+   CheckpointCompatibilityError
+   register_function
+
 
 Definitions
 -----------

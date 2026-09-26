@@ -5,6 +5,13 @@ from .graph import *
 from .sources import *
 from .sinks import *
 from .plugins import load_plugins
+from .checkpoint import (
+    CheckpointBarrier,
+    CheckpointError,
+    CheckpointCompatibilityError,
+    Checkpointer,
+    register_function,
+)
 
 load_plugins(Stream)
 

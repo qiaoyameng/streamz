@@ -17,7 +17,7 @@ from tornado import gen
 
 import streamz as sz
 
-from streamz import RefCounter
+from streamz import RefCounter, Watermark
 from streamz.sources import sink_to_file
 from streamz.utils_test import (inc, double, gen_test, tmpfile, captured_logger,   # noqa: F401
         clean, await_for, metadata, wait_for)  # noqa: F401
@@ -546,6 +546,220 @@ def test_timed_window_backpressure():
     stop = time()
 
     assert stop - start > 0.2
+
+
+def test_event_time_window_basic():
+    source = Stream()
+    L = source.event_time_window(10, timestamp=sz.identity).sink_to_list()
+
+    for x in [1, 2, 11, 3]:  # 3 arrives out of order
+        source.emit(x)
+    assert L == []  # nothing emitted before a watermark passes
+    source.emit(Watermark(10))
+    assert L == [(1, 2, 3)]  # emitted in event-time order
+    source.emit(Watermark(20))
+    assert L == [(1, 2, 3), (11,)]
+
+
+def test_event_time_window_half_open_bounds():
+    source = Stream()
+    L = source.event_time_window(10, timestamp=sz.identity).sink_to_list()
+
+    source.emit(9)
+    source.emit(10)  # exactly on the boundary: belongs to the next window
+    source.emit(Watermark(20))
+    assert L == [(9,), (10,)]
+
+
+def test_event_time_window_allowed_lateness():
+    source = Stream()
+    L = (source.event_time_window(10, timestamp=sz.identity, allowed_lateness=5)
+         .sink_to_list())
+
+    source.emit(1)
+    source.emit(Watermark(10))
+    assert L == []  # window stays open during the lateness period
+    source.emit(7)  # out of order, but its window is not finalized yet
+    source.emit(Watermark(15))
+    assert L == [(1, 7)]
+
+
+def test_event_time_window_late_events():
+    late = []
+    source = Stream()
+    L = (source.event_time_window(10, timestamp=sz.identity, on_late=late.append)
+         .sink_to_list())
+
+    source.emit(1)
+    source.emit(Watermark(10))
+    assert L == [(1,)]
+    source.emit(5)  # window [0, 10) is already finalized
+    assert late == [5]
+    source.emit(12)
+    source.emit(Watermark(20))
+    # the late element was not silently folded into the next window
+    assert L == [(1,), (12,)]
+
+
+def test_event_time_window_late_default_warns():
+    source = Stream()
+    w = source.event_time_window(10, timestamp=sz.identity)
+    source.emit(Watermark(10))
+    with captured_logger('streamz.core') as log:
+        source.emit(5)
+    assert 'late' in log.getvalue().lower()
+    assert w.watermark == 10
+
+
+def test_event_time_window_watermark_monotonic():
+    source = Stream()
+    w = source.event_time_window(10, timestamp=sz.identity)
+    L = w.sink_to_list()
+
+    source.emit(1)
+    source.emit(Watermark(10))
+    source.emit(Watermark(5))  # stale watermark is ignored
+    assert w.watermark == 10
+    source.emit(15)
+    source.emit(Watermark(20))
+    assert L == [(1,), (15,)]
+
+
+@pytest.mark.parametrize('emit_empty', [True, False])
+def test_event_time_window_emit_empty(emit_empty):
+    source = Stream()
+    L = (source.event_time_window(10, timestamp=sz.identity, emit_empty=emit_empty)
+         .sink_to_list())
+
+    source.emit(1)
+    source.emit(25)
+    source.emit(Watermark(30))
+    if emit_empty:
+        assert L == [(1,), (), (25,)]
+    else:
+        assert L == [(1,), (25,)]
+
+
+def test_event_time_window_replay_deterministic():
+    events = [(t, 'payload-%d' % t) for t in [1, 3, 4, 7, 8, 11, 12, 16, 17, 22]]
+    watermarks = [5, 10, 15, 20, 25, 30]
+    expected = [tuple((t, 'payload-%d' % t) for t in group)
+                for group in [[1, 3, 4], [7, 8], [11, 12], [16, 17], [22]]]
+
+    def run(order, interleave=False):
+        source = Stream()
+        L = (source.event_time_window(5, timestamp=lambda e: e[0],
+                                      allowed_lateness=1)
+             .sink_to_list())
+        if interleave:
+            for i in range(5):
+                for e in order:
+                    if 5 * i <= e[0] < 5 * (i + 1):
+                        source.emit(e)
+                source.emit(Watermark(5 * (i + 1)))
+        else:
+            for e in order:
+                source.emit(e)
+        for wm in watermarks:
+            source.emit(Watermark(wm))
+        return L
+
+    forward = events
+    backward = list(reversed(events))
+    shuffled = [events[i] for i in [3, 0, 9, 1, 5, 2, 8, 4, 7, 6]]
+
+    results = [run(forward), run(backward), run(shuffled),
+               run(backward, interleave=True)]
+    assert all(result == expected for result in results)
+
+
+def test_event_time_window_metadata():
+    source = Stream()
+    L = metadata(source.event_time_window(10, timestamp=sz.identity)).sink_to_list()
+
+    source.emit(1, metadata=[{'v': 1}])
+    source.emit(2, metadata=[{'v': 2}])
+    source.emit(11, metadata=[{'v': 3}])
+    source.emit(Watermark(10))
+    source.emit(Watermark(20))
+    assert L == [[{'v': 1}, {'v': 2}], [{'v': 3}]]
+
+
+def test_event_time_window_ref_counts():
+    source = Stream()
+    w = source.event_time_window(10, timestamp=sz.identity)
+    w.sink_to_list()
+
+    ref1 = RefCounter()
+    source.emit(1, metadata=[{'ref': ref1}])
+    assert ref1.count == 1  # held while the element is buffered
+
+    source.emit(Watermark(10))
+    assert ref1.count == 0  # released when the window is finalized
+
+    ref2 = RefCounter()
+    source.emit(12, metadata=[{'ref': ref2}])
+    assert ref2.count == 1
+    w.destroy()
+    assert ref2.count == 0  # state and references reclaimed together
+
+
+def test_event_time_window_convert_duration():
+    pytest.importorskip('pandas')
+    source = Stream()
+    w = source.event_time_window('10s', timestamp=sz.identity,
+                                 allowed_lateness=timedelta(seconds=5))
+    assert w.interval == 10
+    assert w.allowed_lateness == 5
+
+
+def test_event_time_window_datetime():
+    from datetime import datetime
+    source = Stream()
+    L = source.event_time_window(3600, timestamp=sz.identity).sink_to_list()
+
+    t0 = datetime(2026, 9, 27, 12, 0, 1)
+    t1 = datetime(2026, 9, 27, 12, 0, 2)
+    source.emit(t0)
+    source.emit(t1)
+    source.emit(Watermark(datetime(2026, 9, 27, 13, 0, 0)))
+    assert L == [(t0, t1)]
+
+
+@gen_test()
+def test_event_time_window_backpressure():
+    from tornado.locks import Event
+    gate = Event()
+    received = []
+
+    source = Stream(asynchronous=True)
+    w = source.event_time_window(10, timestamp=sz.identity)
+
+    @gen.coroutine
+    def slow_sink(x):
+        yield gate.wait()
+        received.append(x)
+
+    w.sink(slow_sink)
+
+    ref = RefCounter()
+    yield source.emit(1, metadata=[{'ref': ref}])
+    assert ref.count == 1
+
+    future = source.emit(Watermark(10))
+    yield gen.moment
+    yield gen.moment
+    # the downstream is blocked, so the input is not acknowledged yet
+    assert not future.done()
+    assert received == []
+    assert ref.count == 1
+
+    gate.set()
+    yield future
+    yield gen.moment
+    yield gen.moment
+    assert received == [(1,)]
+    assert ref.count == 0
 
 
 def test_sink_to_file():

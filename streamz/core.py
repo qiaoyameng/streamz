@@ -1,7 +1,7 @@
 import asyncio
 import concurrent.futures
 from collections import deque, defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from itertools import chain
 import functools
 import logging
@@ -1323,6 +1323,20 @@ def convert_interval(interval):
     return interval
 
 
+def convert_duration(value):
+    """ Convert a duration given as a number, string, or timedelta to seconds """
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    return convert_interval(value)
+
+
+def convert_timestamp(value):
+    """ Convert an event-time timestamp given as a number or datetime to seconds """
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return value
+
+
 @Stream.register_api()
 class timed_window(Stream):
     """ Emit a tuple of collected results every interval
@@ -1479,6 +1493,172 @@ class timed_window_unique(Stream):
             self._release_refs(m)
             yield self.last
             yield gen.sleep(self.interval)
+
+
+class Watermark:
+    """ An explicit event-time watermark control message
+
+    Emitting a ``Watermark`` into a stream tells downstream
+    ``event_time_window`` operators that no events with a timestamp
+    earlier than ``timestamp`` are expected any more (beyond what
+    ``allowed_lateness`` tolerates).  Watermarks are monotonic: a
+    watermark that does not advance past the current one is ignored.
+
+    Parameters
+    ----------
+    timestamp: number or datetime
+        The event-time position up to which the stream is considered
+        complete.
+    """
+
+    def __init__(self, timestamp):
+        self.timestamp = timestamp
+
+    def __repr__(self):
+        return 'Watermark({0!r})'.format(self.timestamp)
+
+
+@Stream.register_api()
+class event_time_window(Stream):
+    """ Tumbling event-time windows driven by explicit watermarks
+
+    Unlike ``timed_window``, which follows the processing clock, this
+    operator assigns elements to windows based on event time, extracted
+    from each element with the user-provided ``timestamp`` function.
+    A window is finalized and emitted only once an explicit ``Watermark``
+    message passes the window's end plus ``allowed_lateness``.  This
+    makes replaying historical events deterministic: the same events
+    produce the same final window contents regardless of arrival order
+    or wall-clock timing.
+
+    Windows are aligned to multiples of ``interval`` and use half-open
+    bounds ``[start, end)``: an element with a timestamp exactly equal
+    to a window's end belongs to the next window.  Within a window,
+    elements are emitted in event-time order.
+
+    Parameters
+    ----------
+    interval: int, float, str, or timedelta
+        Size of each tumbling window.
+    timestamp: callable
+        Function mapping an element to its event time, as a number of
+        seconds or a ``datetime``.
+    allowed_lateness: int, float, str, or timedelta, optional
+        How long, in event time, a window stays open past its end.  A
+        window is finalized once the watermark reaches
+        ``end + allowed_lateness``.  Out-of-order elements arriving
+        before that point still join their window.
+    on_late: callable, optional
+        Called with each element that arrives after its window has
+        already been finalized.  Late elements are never silently
+        folded into a later window.  If not provided, late elements
+        are dropped with a warning.
+    emit_empty: bool, optional
+        Whether to emit windows that collected no elements (as empty
+        tuples), starting from the window of the first element seen.
+        Defaults to False.
+
+    Examples
+    --------
+    >>> source = Stream()
+    >>> source.event_time_window(10, timestamp=lambda x: x).sink(print)
+    >>> for x in [1, 7, 12, 3]:
+    ...     source.emit(x)
+    >>> source.emit(Watermark(10))
+    (1, 3, 7)
+    >>> source.emit(Watermark(20))
+    (12,)
+    """
+    _graphviz_shape = 'octagon'
+
+    def __init__(self, upstream, interval, timestamp, allowed_lateness=0,
+                 on_late=None, emit_empty=False, **kwargs):
+        self.interval = convert_duration(interval)
+        self.timestamp = timestamp
+        self.allowed_lateness = convert_duration(allowed_lateness)
+        self.on_late = on_late
+        self.emit_empty = emit_empty
+        self.watermark = float('-inf')
+        self._buffers = {}
+        self._metadata_buffers = {}
+        self._next_window_start = None
+        Stream.__init__(self, upstream, **kwargs)
+
+    def _window_start(self, ts):
+        return ts - (ts % self.interval)
+
+    def update(self, x, who=None, metadata=None):
+        if isinstance(x, Watermark):
+            return self._advance_watermark(convert_timestamp(x.timestamp))
+        ts = convert_timestamp(self.timestamp(x))
+        start = self._window_start(ts)
+        if start + self.interval + self.allowed_lateness <= self.watermark:
+            # The window is already finalized; never fold late elements
+            # into a later window.
+            if self.on_late is not None:
+                self.on_late(x)
+            else:
+                logger.warning("event_time_window: dropping late element %r "
+                               "(event time %r, watermark %r)",
+                               x, ts, self.watermark)
+            return []
+        self._retain_refs(metadata)
+        self._buffers.setdefault(start, []).append((ts, x))
+        if isinstance(metadata, list):
+            self._metadata_buffers.setdefault(start, []).extend(metadata)
+        elif metadata is not None:
+            self._metadata_buffers.setdefault(start, []).append(metadata)
+        if self._next_window_start is None:
+            self._next_window_start = start
+        else:
+            self._next_window_start = min(self._next_window_start, start)
+        return []
+
+    def _advance_watermark(self, ts):
+        if ts <= self.watermark:
+            # Watermarks only move forward; stale ones are ignored.
+            return []
+        self.watermark = ts
+        results = []
+        while (self._next_window_start is not None and
+               self._next_window_start + self.interval + self.allowed_lateness <= ts):
+            start = self._next_window_start
+            self._next_window_start = start + self.interval
+            buffer = self._buffers.pop(start, None)
+            metadata = self._metadata_buffers.pop(start, [])
+            if buffer is not None:
+                data = tuple(x for _, x in sorted(buffer, key=lambda pair: pair[0]))
+                results.extend(self._emit_and_release(data, metadata))
+            elif self.emit_empty:
+                results.extend(self._emit_and_release(tuple(), []))
+        return results
+
+    def _emit_and_release(self, data, metadata):
+        results = self._emit(data, metadata)
+        pending = [r for r in results if gen.is_future(r)]
+        if pending:
+            # Hold our references until the asynchronous downstream has
+            # finished processing, so inputs are not acknowledged early.
+            remaining = [len(pending)]
+            loop = self.loop or get_io_loop()
+
+            def release_when_done(_future):
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    self._release_refs(metadata)
+
+            for future in pending:
+                loop.add_future(future, release_when_done)
+        else:
+            self._release_refs(metadata)
+        return results
+
+    def destroy(self, streams=None):
+        for metadata in self._metadata_buffers.values():
+            self._release_refs(metadata)
+        self._buffers.clear()
+        self._metadata_buffers.clear()
+        Stream.destroy(self, streams=streams)
 
 
 @Stream.register_api()

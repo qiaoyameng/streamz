@@ -19,6 +19,7 @@ Stream
    collect
    combine_latest
    delay
+   event_time_window
    filter
    flatten
    map
@@ -89,6 +90,7 @@ Definitions
 .. autofunction:: delay
 .. autofunction:: filter
 .. autofunction:: flatten
+.. autofunction:: event_time_window
 .. autofunction:: map
 .. autofunction:: partition
 .. autofunction:: rate_limit

@@ -1026,6 +1026,195 @@ class accumulate(Stream):
                 return self._emit(result, metadata=metadata)
 
 
+class ChangelogError(Exception):
+    """ Base class for errors raised by changelog aggregation """
+
+
+class DuplicateEventError(ChangelogError):
+    """ An event id was added twice with a conflicting value """
+
+
+class UnknownEventError(ChangelogError):
+    """ A retraction references an event id that is not currently live """
+
+
+class _GroupDeleted(object):
+    """ Sentinel type marking the deletion of a group """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = object.__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'GROUP_DELETED'
+
+    def __reduce__(self):
+        return (_GroupDeleted, ())
+
+
+GROUP_DELETED = _GroupDeleted()
+
+
+class _ChangelogGroup(object):
+    """ Internal per-key state for changelog_aggregate """
+
+    __slots__ = ('aggregate', 'events')
+
+    def __init__(self, aggregate):
+        self.aggregate = aggregate
+        self.events = {}  # event_id -> (value, metadata)
+
+
+@Stream.register_api()
+class changelog_aggregate(Stream):
+    """ Aggregate a changelog of additions and retractions per key
+
+    Upstream systems may correct data they have already emitted, which a
+    one-way ``accumulate`` cannot undo.  This operator consumes changelog
+    records of the form ``(key, event_id, value, is_add)`` where
+    ``event_id`` is a stable identifier chosen by the producer and
+    ``is_add`` is True for additions and False for retractions, and emits
+    the latest aggregate for every key as ``(key, aggregate)`` tuples.
+
+    The caller provides two reduction functions:
+    - ``add(aggregate, value)`` folds a new value into the aggregate
+    - ``retract(aggregate, value)`` removes a previously added value
+
+    Both must be pure inverses of each other; the aggregate of a new group
+    starts from ``start``.
+
+    The operator enforces changelog consistency:
+    - Re-adding an already live event id with the same value is an
+      idempotent duplicate and is ignored without emitting.
+    - Re-adding a live event id with a different value raises
+      ``DuplicateEventError``.
+    - Retracting an event id that is not live raises
+      ``UnknownEventError``.
+
+    Retractions apply the inverse of the value that was originally added,
+    so corrections are performed by retracting the stale event and adding
+    a replacement under a new event id.  When the last member of a
+    group is retracted the group is deleted and an explicit
+    ``(key, GROUP_DELETED)`` event is emitted.
+
+    Reductions are applied atomically: if ``add`` or ``retract`` raises,
+    no state is modified.  Metadata references of each added event are
+    retained for exactly as long as the event is live and released when
+    the event is retracted.
+
+    Parameters
+    ----------
+    add: callable
+        ``add(aggregate, value) -> new aggregate`` for an incoming addition
+    retract: callable
+        ``retract(aggregate, value) -> new aggregate``, the inverse of ``add``
+    start: object
+        Initial aggregate of a newly created group
+
+    Examples
+    --------
+    Counting live events per key, through addition, an idempotent
+    duplicate, a correction and finally a full clear
+
+    >>> source = Stream()
+    >>> counts = source.changelog_aggregate(
+    ...     lambda acc, x: acc + 1, lambda acc, x: acc - 1, start=0
+    ... ).sink(print)
+    >>> source.emit(('user-a', 'e1', None, True))   # add
+    ('user-a', 1)
+    >>> source.emit(('user-a', 'e1', None, True))   # duplicate add, ignored
+    >>> source.emit(('user-a', 'e2', None, True))
+    ('user-a', 2)
+    >>> source.emit(('user-a', 'e1', None, False))  # retract stale event
+    ('user-a', 1)
+    >>> source.emit(('user-a', 'e3', None, True))   # corrected replacement
+    ('user-a', 2)
+    >>> source.emit(('user-a', 'e2', None, False))
+    ('user-a', 1)
+    >>> source.emit(('user-a', 'e3', None, False))  # last member leaves
+    ('user-a', GROUP_DELETED)
+
+    Summing values per key; a correction retracts the stale value before
+    adding the amended one
+
+    >>> source = Stream()
+    >>> sums = source.changelog_aggregate(
+    ...     lambda acc, x: acc + x, lambda acc, x: acc - x, start=0
+    ... ).sink(print)
+    >>> source.emit(('acct', 't1', 10, True))
+    ('acct', 10)
+    >>> source.emit(('acct', 't2', 5, True))
+    ('acct', 15)
+    >>> source.emit(('acct', 't1', 10, False))  # retract stale t1
+    ('acct', 5)
+    >>> source.emit(('acct', 't3', 12, True))   # corrected amount
+    ('acct', 17)
+    >>> source.emit(('acct', 't2', 5, False))
+    ('acct', 12)
+    >>> source.emit(('acct', 't3', 12, False))  # group is now empty
+    ('acct', GROUP_DELETED)
+    """
+    _graphviz_shape = 'box'
+
+    def __init__(self, upstream, add, retract, start, **kwargs):
+        self.add = add
+        self.retract = retract
+        self.start = start
+        self.groups = {}
+        stream_name = kwargs.pop('stream_name', None)
+        Stream.__init__(self, upstream, stream_name=stream_name)
+
+    def update(self, x, who=None, metadata=None):
+        key, event_id, value, is_add = x
+        if is_add:
+            return self._add(key, event_id, value, metadata)
+        else:
+            return self._remove(key, event_id, metadata)
+
+    def _add(self, key, event_id, value, metadata):
+        group = self.groups.get(key)
+        if group is not None and event_id in group.events:
+            existing_value, _ = group.events[event_id]
+            if existing_value != value:
+                raise DuplicateEventError(
+                    "Event %r of key %r already added with value %r, "
+                    "got conflicting value %r"
+                    % (event_id, key, existing_value, value))
+            # idempotent duplicate: no state change, no output
+            return []
+        previous = group.aggregate if group is not None else self.start
+        # compute before mutating: a failing reduction leaves no partial state
+        aggregate = self.add(previous, value)
+        if group is None:
+            group = self.groups[key] = _ChangelogGroup(self.start)
+        group.aggregate = aggregate
+        group.events[event_id] = (value, metadata)
+        if metadata:
+            self._retain_refs(metadata)
+        return self._emit((key, aggregate), metadata=metadata)
+
+    def _remove(self, key, event_id, metadata):
+        group = self.groups.get(key)
+        if group is None or event_id not in group.events:
+            raise UnknownEventError(
+                "Cannot retract event %r of key %r: no such live event"
+                % (event_id, key))
+        value, held_metadata = group.events[event_id]
+        # compute before mutating: a failing reduction leaves no partial state
+        aggregate = self.retract(group.aggregate, value)
+        del group.events[event_id]
+        if held_metadata:
+            self._release_refs(held_metadata)
+        if not group.events:
+            del self.groups[key]
+            return self._emit((key, GROUP_DELETED), metadata=metadata)
+        group.aggregate = aggregate
+        return self._emit((key, aggregate), metadata=metadata)
+
+
 @Stream.register_api()
 class slice(Stream):
     """

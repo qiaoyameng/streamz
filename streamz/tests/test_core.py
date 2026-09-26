@@ -1728,6 +1728,170 @@ def test_accumulate_errors_raises():
         a.emit(0)
 
 
+def test_changelog_aggregate_count():
+    source = Stream()
+    L = source.changelog_aggregate(
+        lambda acc, x: acc + 1, lambda acc, x: acc - 1, start=0,
+    ).sink_to_list()
+
+    source.emit(('user-a', 'e1', None, True))
+    source.emit(('user-a', 'e1', None, True))  # idempotent duplicate
+    source.emit(('user-a', 'e2', None, True))
+    source.emit(('user-b', 'e9', None, True))  # independent group
+    source.emit(('user-a', 'e1', None, False))  # correction: retract stale
+    source.emit(('user-a', 'e3', None, True))   # ... and add replacement
+    source.emit(('user-a', 'e2', None, False))
+    source.emit(('user-a', 'e3', None, False))  # last member: group deleted
+    source.emit(('user-a', 'e4', None, True))   # group starts over
+
+    assert L == [
+        ('user-a', 1),
+        ('user-a', 2),
+        ('user-b', 1),
+        ('user-a', 1),
+        ('user-a', 2),
+        ('user-a', 1),
+        ('user-a', sz.GROUP_DELETED),
+        ('user-a', 1),
+    ]
+
+
+def test_changelog_aggregate_sum():
+    source = Stream()
+    L = source.changelog_aggregate(
+        lambda acc, x: acc + x, lambda acc, x: acc - x, start=0,
+    ).sink_to_list()
+
+    source.emit(('acct', 't1', 10, True))
+    source.emit(('acct', 't2', 5, True))
+    source.emit(('acct', 't1', 10, False))  # upstream corrects t1
+    source.emit(('acct', 't3', 12, True))   # amended amount
+    source.emit(('acct', 't2', 5, False))
+    source.emit(('acct', 't3', 12, False))
+
+    assert L == [
+        ('acct', 10),
+        ('acct', 15),
+        ('acct', 5),
+        ('acct', 17),
+        ('acct', 12),
+        ('acct', sz.GROUP_DELETED),
+    ]
+
+
+def test_changelog_aggregate_duplicate_conflict():
+    source = Stream()
+    b = source.changelog_aggregate(
+        lambda acc, x: acc + x, lambda acc, x: acc - x, start=0)
+    L = b.sink_to_list()
+
+    source.emit(('k', 'e1', 1, True))
+    with pytest.raises(sz.DuplicateEventError):
+        source.emit(('k', 'e1', 2, True))
+
+    # the failed add left no partial state behind
+    assert b.groups['k'].aggregate == 1
+    assert set(b.groups['k'].events) == {'e1'}
+    source.emit(('k', 'e1', 1, False))
+    assert L == [('k', 1), ('k', sz.GROUP_DELETED)]
+    assert b.groups == {}
+
+
+def test_changelog_aggregate_unknown_retract():
+    source = Stream()
+    b = source.changelog_aggregate(
+        lambda acc, x: acc + x, lambda acc, x: acc - x, start=0)
+    L = b.sink_to_list()
+
+    with pytest.raises(sz.UnknownEventError):
+        source.emit(('k', 'missing', 1, False))
+
+    source.emit(('k', 'e1', 1, True))
+    with pytest.raises(sz.UnknownEventError):
+        source.emit(('k', 'missing', 1, False))
+    with pytest.raises(sz.UnknownEventError):
+        source.emit(('other', 'e1', 1, False))
+
+    assert L == [('k', 1)]
+    assert set(b.groups['k'].events) == {'e1'}
+
+
+def test_changelog_aggregate_failed_reduction_is_atomic():
+    fail = {'add': False, 'retract': False}
+
+    def add(acc, x):
+        if fail['add']:
+            raise ValueError('boom')
+        return acc + x
+
+    def retract(acc, x):
+        if fail['retract']:
+            raise ValueError('boom')
+        return acc - x
+
+    source = Stream()
+    b = source.changelog_aggregate(add, retract, start=0)
+    L = b.sink_to_list()
+
+    source.emit(('k', 'e1', 1, True))
+    fail['add'] = True
+    with pytest.raises(ValueError):
+        source.emit(('k', 'e2', 2, True))
+    # failed add: no event recorded, aggregate untouched
+    assert b.groups['k'].aggregate == 1
+    assert set(b.groups['k'].events) == {'e1'}
+
+    fail['add'] = False
+    source.emit(('k', 'e2', 2, True))  # group still consistent, retry works
+    assert b.groups['k'].aggregate == 3
+
+    fail['retract'] = True
+    with pytest.raises(ValueError):
+        source.emit(('k', 'e1', 1, False))
+    # failed retract: event still live, aggregate untouched
+    assert b.groups['k'].aggregate == 3
+    assert set(b.groups['k'].events) == {'e1', 'e2'}
+
+    fail['retract'] = False
+    source.emit(('k', 'e1', 1, False))
+    source.emit(('k', 'e2', 2, False))
+    assert L == [('k', 1), ('k', 3), ('k', 2), ('k', sz.GROUP_DELETED)]
+    assert b.groups == {}
+
+
+def test_changelog_aggregate_metadata_lifetime():
+    source = Stream()
+    b = source.changelog_aggregate(
+        lambda acc, x: acc + 1, lambda acc, x: acc - 1, start=0)
+    L = b.sink_to_list()  # noqa: F841
+
+    r1 = RefCounter()
+    source.emit(('k', 'e1', None, True), metadata=[{'ref': r1}])
+    # metadata of a live event is retained by the operator
+    assert r1.count == 1
+
+    r2 = RefCounter()
+    source.emit(('k', 'e2', None, True), metadata=[{'ref': r2}])
+    assert r1.count == 1
+    assert r2.count == 1
+
+    # duplicate add does not retain again
+    r1b = RefCounter()
+    source.emit(('k', 'e1', None, True), metadata=[{'ref': r1b}])
+    assert r1.count == 1
+    assert r1b.count == 0
+
+    # retraction releases exactly the metadata of the retracted event
+    source.emit(('k', 'e1', None, False))
+    assert r1.count == 0
+    assert r2.count == 1
+
+    # deleting the group releases the last event's metadata
+    source.emit(('k', 'e2', None, False))
+    assert r2.count == 0
+    assert b.groups == {}
+
+
 @gen_test()
 def test_sync_in_event_loop():
     a = Stream()

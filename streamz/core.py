@@ -1859,6 +1859,166 @@ class union(Stream):
         return self._emit(x, metadata=metadata)
 
 
+class MergeSortedError(ValueError):
+    """ Raised when an input of merge_sorted violates its sorted order """
+
+
+class _EndOfInput(object):
+    """ Sentinel signalling that an input stream of merge_sorted is finished
+
+    Emit this on an input stream once its final chunk has been emitted.
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = object.__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'END_OF_INPUT'
+
+
+END_OF_INPUT = _EndOfInput()
+
+
+@Stream.register_api()
+class merge_sorted(Stream):
+    """ Merge multiple sorted streams of chunks into one sorted stream
+
+    Each upstream emits chunks (iterables) of elements that are already
+    sorted according to ``key``.  Elements are pulled incrementally from the
+    heads of the inputs; the inputs are never collected wholesale and
+    re-sorted.
+
+    Every input must eventually emit the ``END_OF_INPUT`` sentinel to signal
+    that no further chunks will arrive.  The next output element is only
+    decided once every input that has not ended has a head element
+    available, guaranteeing a globally ordered output.  Elements with equal
+    keys are emitted stably: ordered by input number first, then by their
+    original order within that input.
+
+    If an input emits elements out of order a ``MergeSortedError`` is raised
+    reporting the input number and the offending pair of keys.
+
+    Parameters
+    ----------
+    upstreams: Stream
+        The input streams, each emitting sorted chunks of elements
+    key: callable, optional
+        Function extracting the sort key from an element.
+        Defaults to the identity function.
+    maxsize: int, optional
+        Maximum number of pending chunks buffered per input before
+        backpressure is applied to that input.  Defaults to 10.
+
+    Examples
+    --------
+    >>> a = Stream()
+    >>> b = Stream()
+    >>> L = a.merge_sorted(b).sink_to_list()
+    >>> a.emit([1, 3, 5])
+    >>> b.emit([2, 4])
+    >>> a.emit(END_OF_INPUT)
+    >>> b.emit(END_OF_INPUT)
+    >>> L
+    [1, 2, 3, 4, 5]
+
+    See also
+    --------
+    union
+    zip
+    """
+    _graphviz_orientation = 270
+    _graphviz_shape = 'triangle'
+
+    def __init__(self, *upstreams, **kwargs):
+        self.key = kwargs.pop('key', None) or identity
+        self.maxsize = kwargs.pop('maxsize', 10)
+        self._condition = None
+        self.buffers = {upstream: deque() for upstream in upstreams}
+        self.ended = set()
+        self.last_keys = {}
+        Stream.__init__(self, upstreams=upstreams, **kwargs)
+
+    @property
+    def condition(self):
+        if self._condition is None:
+            self._condition = Condition()
+        return self._condition
+
+    def _add_upstream(self, upstream):
+        # Override method to handle setup of buffer for new stream
+        self.buffers[upstream] = deque()
+        super(merge_sorted, self)._add_upstream(upstream)
+
+    def _remove_upstream(self, upstream):
+        # Override method to release buffered metadata for removed stream
+        buf = self.buffers.pop(upstream, None)
+        if buf:
+            while buf:
+                _, metadata = buf.popleft()
+                self._release_refs(metadata)
+            self.condition.notify_all()
+        self.ended.discard(upstream)
+        self.last_keys.pop(upstream, None)
+        super(merge_sorted, self)._remove_upstream(upstream)
+
+    def update(self, x, who=None, metadata=None):
+        if x is END_OF_INPUT:
+            self.ended.add(who)
+            return self._drain()
+        chunk = deque(x)
+        self._validate(who, chunk)
+        self._retain_refs(metadata)
+        self.buffers[who].append((chunk, metadata))
+        results = self._drain()
+        if len(self.buffers[who]) > self.maxsize:
+            results.append(self.condition.wait())
+        return results
+
+    def _validate(self, who, chunk):
+        if not chunk:
+            return
+        last = self.last_keys.get(who, no_default)
+        for item in chunk:
+            k = self.key(item)
+            if last is not no_default and k < last:
+                i = self.upstreams.index(who)
+                raise MergeSortedError(
+                    "Input %d to merge_sorted is not sorted: "
+                    "key %r was followed by key %r" % (i, last, k))
+            last = k
+        self.last_keys[who] = last
+
+    def _drain(self):
+        results = []
+        while True:
+            for upstream in self.upstreams:
+                buf = self.buffers[upstream]
+                while buf and not buf[0][0]:
+                    _, metadata = buf.popleft()
+                    self._release_refs(metadata)
+                    self.condition.notify_all()
+            heads = []
+            blocked = False
+            for i, upstream in enumerate(self.upstreams):
+                buf = self.buffers[upstream]
+                if not buf:
+                    if upstream not in self.ended:
+                        blocked = True
+                        break
+                    continue
+                heads.append((self.key(buf[0][0][0]), i, upstream))
+            if blocked or not heads:
+                break
+            _, _, upstream = min(heads)
+            chunk, metadata = self.buffers[upstream][0]
+            item = chunk.popleft()
+            results.extend(self._emit(item, metadata))
+        return results
+
+
 @Stream.register_api()
 class pluck(Stream):
     """ Select elements from elements in the stream.

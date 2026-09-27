@@ -1014,6 +1014,204 @@ def test_union():
     assert L == [1, 2, 3, 4]
 
 
+def test_merge_sorted():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    a.emit([1, 3, 5])
+    assert L == []  # b has no head element yet
+    b.emit([2, 4])
+    assert L == [1, 2, 3, 4]
+    a.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3, 4]  # b has not ended and has no head
+    b.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3, 4, 5]
+
+
+def test_merge_sorted_empty_input():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    a.emit(sz.END_OF_INPUT)  # empty input ends immediately
+    b.emit([1, 2])
+    assert L == [1, 2]
+    b.emit([3])
+    assert L == [1, 2, 3]
+    b.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3]
+
+
+def test_merge_sorted_empty_chunks():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    a.emit([])
+    a.emit([1])
+    b.emit([])
+    assert L == []
+    b.emit([0])
+    assert L == [0]  # b has no head element, so 1 stays buffered
+    a.emit(sz.END_OF_INPUT)
+    b.emit(sz.END_OF_INPUT)
+    assert L == [0, 1]
+
+
+def test_merge_sorted_key():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b, key=lambda x: x[0]).sink_to_list()
+
+    a.emit([(1, 'a'), (3, 'a')])
+    b.emit([(2, 'b')])
+    a.emit(sz.END_OF_INPUT)
+    b.emit(sz.END_OF_INPUT)
+    assert L == [(1, 'a'), (2, 'b'), (3, 'a')]
+
+
+def test_merge_sorted_duplicate_keys():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b, key=lambda x: x[0]).sink_to_list()
+
+    # equal keys are stable: input number first, then original order
+    a.emit([(1, 'a1'), (1, 'a2')])
+    b.emit([(1, 'b1'), (1, 'b2')])
+    a.emit(sz.END_OF_INPUT)
+    b.emit(sz.END_OF_INPUT)
+    assert L == [(1, 'a1'), (1, 'a2'), (1, 'b1'), (1, 'b2')]
+
+
+def test_merge_sorted_end_of_input_last_chunk():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    a.emit([1, 4])
+    b.emit([2, 3])
+    # the end-of-input signal is the last thing sent on each input
+    a.emit(sz.END_OF_INPUT)
+    b.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3, 4]
+
+
+def test_merge_sorted_waits_for_all_inputs():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    # nothing can be emitted while b has neither data nor end-of-input
+    a.emit([1, 2, 3])
+    assert L == []
+    b.emit([10])
+    assert L == [1, 2, 3]
+    b.emit(sz.END_OF_INPUT)
+    a.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3, 10]
+
+
+def test_merge_sorted_out_of_order():
+    a = Stream()
+    b = Stream()
+
+    a.merge_sorted(b).sink_to_list()
+
+    a.emit([1, 3])
+    b.emit([2])
+    with pytest.raises(sz.MergeSortedError) as excinfo:
+        a.emit([2])  # 2 follows 3 on input 0
+    msg = str(excinfo.value)
+    assert '0' in msg
+    assert '3' in msg and '2' in msg
+
+
+def test_merge_sorted_out_of_order_within_chunk():
+    a = Stream()
+    b = Stream()
+
+    L = a.merge_sorted(b).sink_to_list()
+
+    b.emit([0])
+    with pytest.raises(sz.MergeSortedError):
+        a.emit([2, 1])
+    assert L == []  # the violating chunk is rejected before anything emits
+
+
+@gen_test()
+def test_merge_sorted_backpressure():
+    a = Stream(asynchronous=True)
+    b = Stream(asynchronous=True)
+    c = sz.merge_sorted(a, b, maxsize=2)
+
+    L = c.sink_to_list()
+
+    # b is extremely slow: a's chunks pile up without being consumed
+    a.emit([1])
+    a.emit([3])
+
+    future = a.emit([5])
+    with pytest.raises(gen.TimeoutError):
+        yield gen.with_timeout(timedelta(seconds=0.01), future)
+
+    b.emit([2])  # frees one pending chunk of a
+    yield future
+
+    assert L == [1, 2]  # b has no head element, so 3 stays buffered
+    b.emit(sz.END_OF_INPUT)
+    a.emit(sz.END_OF_INPUT)
+    assert L == [1, 2, 3, 5]
+
+
+def test_merge_sorted_ref_counts():
+    a = Stream()
+    b = Stream()
+    c = sz.merge_sorted(a, b)
+
+    c.sink_to_list()
+
+    # chunk from a is buffered while b has no head element
+    ref1 = RefCounter()
+    a.emit([1, 3], metadata=[{'ref': ref1}])
+    assert ref1.count == 1
+
+    # elements emitted from the chunk release their references
+    ref2 = RefCounter()
+    b.emit([2], metadata=[{'ref': ref2}])
+    assert ref1.count == 1  # 3 is still buffered
+    assert ref2.count == 0
+
+    a.emit(sz.END_OF_INPUT)
+    b.emit(sz.END_OF_INPUT)
+    assert ref1.count == 0
+
+
+def test_merge_sorted_destroy_releases_metadata():
+    a = Stream()
+    b = Stream()
+    c = sz.merge_sorted(a, b)
+
+    c.sink_to_list()
+
+    ref1 = RefCounter()
+    a.emit([1, 3], metadata=[{'ref': ref1}])
+    assert ref1.count == 1
+
+    # cancelling the node releases buffered metadata
+    c.destroy()
+    assert ref1.count == 0
+    assert not list(a.downstreams)
+    assert not c.upstreams
+
+
 def test_pluck():
     a = Stream()
     L = a.pluck(1).sink_to_list()

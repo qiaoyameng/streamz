@@ -1323,6 +1323,43 @@ def convert_interval(interval):
     return interval
 
 
+class Watermark:
+    """ An explicit event-time watermark message
+
+    Emit instances of this class into a stream to advance the event-time
+    clock of ``event_time_window`` nodes downstream.  A watermark of ``t``
+    declares that event time has progressed to ``t``: any window whose end
+    (plus ``allowed_lateness``) lies at or before ``t`` is finalized.
+
+    Watermarks are consumed by ``event_time_window`` nodes and are not
+    passed further downstream.
+
+    Parameters
+    ----------
+    time: number
+        The event-time timestamp of the watermark, in the same units as
+        the values returned by the ``timestamp`` function of the
+        ``event_time_window`` nodes that consume it.
+
+    Examples
+    --------
+    >>> source = Stream()
+    >>> L = source.event_time_window(10, timestamp=lambda x: x[0]).sink_to_list()
+    >>> source.emit((1, 'a'))
+    >>> source.emit(Watermark(10))
+    >>> L
+    [((1, 'a'),)]
+    """
+    def __init__(self, time):
+        self.time = time
+
+    def __eq__(self, other):
+        return isinstance(other, Watermark) and self.time == other.time
+
+    def __repr__(self):
+        return 'Watermark({})'.format(self.time)
+
+
 @Stream.register_api()
 class timed_window(Stream):
     """ Emit a tuple of collected results every interval
@@ -1479,6 +1516,145 @@ class timed_window_unique(Stream):
             self._release_refs(m)
             yield self.last
             yield gen.sleep(self.interval)
+
+
+@Stream.register_api()
+class event_time_window(Stream):
+    """ Tumbling windows over event time, driven by explicit watermarks
+
+    Unlike ``timed_window``, which groups elements by wall-clock processing
+    time, this node assigns each element to a fixed, half-open window
+    ``[start, start + interval)`` based on the element's own timestamp.  A
+    window is only finalized and emitted once the event-time watermark
+    (advanced by emitting ``Watermark`` messages upstream) reaches the end
+    of the window plus ``allowed_lateness``.  Because the output depends
+    only on event timestamps and watermarks, replaying the same history in
+    a different arrival order yields the same final windows, and no wall
+    clock is involved.
+
+    Watermarks must never decrease; non-advancing watermarks are ignored.
+    Out-of-order elements still join their window as long as it has not
+    been finalized.  Elements arriving after their window was finalized
+    are late: they are handed to the ``on_late`` callback and are never
+    silently folded into a later window.
+
+    Parameters
+    ----------
+    interval: number or str
+        Size of each tumbling window, in the same units as the event
+        timestamps (or a ``pandas``-style duration string).
+    timestamp: callable
+        Function mapping an element to its event-time timestamp.
+    allowed_lateness: number or str
+        Extra event-time delay tolerated past a window's end before the
+        window is finalized.  An element is late once the watermark has
+        passed the end of its window plus this delay.
+    on_late: callable, optional
+        Callback invoked with each late element.  If not given, late
+        elements are dropped.
+    emit_empty: bool
+        Whether to emit windows that contain no elements.  Empty windows
+        are only emitted within the span of event time actually observed,
+        i.e. starting from the window of the first element seen.
+
+    Examples
+    --------
+    >>> source = Stream()
+    >>> L = source.event_time_window(10, timestamp=lambda x: x[0]).sink_to_list()
+    >>> source.emit((1, 'a'))
+    >>> source.emit((3, 'b'))
+    >>> source.emit((12, 'c'))
+    >>> source.emit(Watermark(10))   # finalizes the [0, 10) window
+    >>> L
+    [((1, 'a'), (3, 'b'))]
+    >>> source.emit(Watermark(20))   # finalizes the [10, 20) window
+    >>> L
+    [((1, 'a'), (3, 'b')), ((12, 'c'),)]
+    """
+    _graphviz_shape = 'octagon'
+
+    def __init__(self, upstream, interval, timestamp, allowed_lateness=0,
+                 on_late=None, emit_empty=False, **kwargs):
+        self.interval = convert_interval(interval)
+        if self.interval <= 0:
+            raise ValueError("interval must be positive")
+        self.timestamp = timestamp
+        self.allowed_lateness = convert_interval(allowed_lateness)
+        if self.allowed_lateness < 0:
+            raise ValueError("allowed_lateness must be non-negative")
+        self.on_late = on_late
+        self.emit_empty = emit_empty
+        self.watermark = None
+        self._windows = {}
+        self._next_open = None
+        Stream.__init__(self, upstream, **kwargs)
+
+    def _window_start(self, ts):
+        return (ts // self.interval) * self.interval
+
+    def update(self, x, who=None, metadata=None):
+        if isinstance(x, Watermark):
+            return self.advance_watermark(x.time)
+        ts = self.timestamp(x)
+        start = self._window_start(ts)
+        if (self.watermark is not None
+                and start + self.interval + self.allowed_lateness <= self.watermark):
+            # The window is already finalized; never fold late elements
+            # into a later window.
+            if self.on_late is not None:
+                self.on_late(x)
+            return []
+        self._retain_refs(metadata)
+        self._windows.setdefault(start, []).append((ts, x, metadata))
+        if self._next_open is None or start < self._next_open:
+            self._next_open = start
+        return []
+
+    def advance_watermark(self, t):
+        """ Advance the event-time watermark, finalizing expired windows
+
+        Returns the (possibly empty) list of downstream results so that
+        asynchronous backpressure propagates to the caller.
+        """
+        if self.watermark is not None and t < self.watermark:
+            logger.warning(
+                "Ignoring watermark %s: watermarks must not decrease "
+                "(current watermark is %s)", t, self.watermark)
+            return []
+        self.watermark = t
+        return self._finalize_windows()
+
+    def _finalize_windows(self):
+        horizon = self.watermark - self.allowed_lateness
+        if self.emit_empty and self._next_open is not None:
+            starts = []
+            start = self._next_open
+            while start + self.interval <= horizon:
+                starts.append(start)
+                start += self.interval
+            self._next_open = start
+        else:
+            starts = sorted(s for s in self._windows
+                            if s + self.interval <= horizon)
+        results = []
+        for start in starts:
+            entries = self._windows.pop(start, [])
+            entries.sort(key=lambda entry: entry[0])
+            elements = tuple(entry[1] for entry in entries)
+            md = [m for entry in entries for m in (entry[2] or [])]
+            results.extend(self._emit(elements, md))
+            self._release_refs(md)
+        return results
+
+    def destroy(self, streams=None):
+        # Reclaim buffered operator state together with the reference
+        # counts of any metadata still held by open windows.
+        for entries in self._windows.values():
+            for _, _, md in entries:
+                self._release_refs(md)
+        self._windows.clear()
+        self._next_open = None
+        Stream.destroy(self, streams)
 
 
 @Stream.register_api()

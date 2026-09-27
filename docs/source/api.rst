@@ -23,6 +23,7 @@ Stream
    flatten
    map
    map_async
+   merge_sorted
    partition
    rate_limit
    scatter
@@ -90,6 +91,7 @@ Definitions
 .. autofunction:: filter
 .. autofunction:: flatten
 .. autofunction:: map
+.. autofunction:: merge_sorted
 .. autofunction:: partition
 .. autofunction:: rate_limit
 .. autofunction:: sink

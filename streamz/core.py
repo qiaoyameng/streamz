@@ -1649,6 +1649,211 @@ class zip(Stream):
             return self.condition.wait()
 
 
+_no_head = '--no-head--'
+_no_key = '--no-key--'
+
+
+class EndOfInput(object):
+    """ Sentinel used to signal end-of-input to ``merge_sorted``
+
+    Emit the pre-made ``END_OF_INPUT`` instance (or any ``EndOfInput``) into
+    an input stream of ``merge_sorted`` to declare that no further chunks
+    will arrive on that input.
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = object.__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'END_OF_INPUT'
+
+
+END_OF_INPUT = EndOfInput()
+
+
+@Stream.register_api()
+class merge_sorted(Stream):
+    """ Merge several sorted streams of chunks into one sorted stream
+
+    Each upstream emits chunks (iterables) of elements that are already
+    sorted according to ``key``.  This node incrementally merges them into
+    a single stream of individual elements in sorted order, without ever
+    collecting all of the input at once.
+
+    An element is only emitted once every input that has not yet signalled
+    end-of-input has a pending head element, so no smaller element can
+    still arrive from a slow input.  Each input must eventually emit the
+    ``END_OF_INPUT`` sentinel to declare that no more chunks will come;
+    ended inputs no longer block the merge and are drained.
+
+    Elements with equal keys are ordered stably, first by input position
+    and then by their original order within that input.
+
+    Each input buffers at most ``maxsize`` unprocessed chunks.  Beyond
+    that, backpressure is applied through the asynchronous machinery: the
+    returned future only resolves once buffered chunks have been consumed.
+    Destroying the node releases the metadata references of all buffered
+    chunks.
+
+    Parameters
+    ----------
+    upstreams: Streams
+        Input streams, each emitting chunks sorted by ``key``
+    key: callable, optional
+        Function mapping an element to its sort key.  Defaults to the
+        identity function.
+    maxsize: int, optional
+        Maximum number of pending chunks per input before backpressure is
+        applied.  Defaults to 10.
+
+    Examples
+    --------
+    >>> a = Stream()
+    >>> b = Stream()
+    >>> m = merge_sorted(a, b)
+    >>> L = m.sink_to_list()
+    >>> a.emit([1, 4])
+    >>> b.emit([2, 3])
+    >>> b.emit(END_OF_INPUT)
+    >>> a.emit(END_OF_INPUT)
+    >>> L
+    [1, 2, 3, 4]
+
+    See Also
+    --------
+    zip
+    combine_latest
+    union
+    """
+    _graphviz_orientation = 270
+    _graphviz_shape = 'triangle'
+
+    def __init__(self, *upstreams, **kwargs):
+        key = kwargs.pop('key', None)
+        self.key = key if key is not None else identity
+        self.maxsize = kwargs.pop('maxsize', 10)
+        self._condition = None
+        self.buffers = {}
+        self.heads = {}
+        self.last_keys = {}
+        self.ended = set()
+        for upstream in upstreams:
+            self.buffers[upstream] = deque()
+            self.heads[upstream] = _no_head
+            self.last_keys[upstream] = _no_key
+        Stream.__init__(self, upstreams=upstreams, **kwargs)
+
+    @property
+    def condition(self):
+        if self._condition is None:
+            self._condition = Condition()
+        return self._condition
+
+    def _add_upstream(self, upstream):
+        # Override method to handle setup of buffer for new stream
+        self.buffers[upstream] = deque()
+        self.heads[upstream] = _no_head
+        self.last_keys[upstream] = _no_key
+        super(merge_sorted, self)._add_upstream(upstream)
+
+    def _remove_upstream(self, upstream):
+        # Override method to handle removal of buffer for stream
+        buffer = self.buffers.pop(upstream)
+        while buffer:
+            _, metadata = buffer.popleft()
+            self._release_refs(metadata)
+        self.heads.pop(upstream)
+        self.last_keys.pop(upstream)
+        self.ended.discard(upstream)
+        super(merge_sorted, self)._remove_upstream(upstream)
+
+    def destroy(self, streams=None):
+        """ Disconnect from upstreams, releasing buffered metadata """
+        for upstream in list(self.upstreams):
+            buffer = self.buffers[upstream]
+            while buffer:
+                _, metadata = buffer.popleft()
+                self._release_refs(metadata)
+            self.heads[upstream] = _no_head
+        if self._condition is not None:
+            self._condition.notify_all()
+        Stream.destroy(self, streams=streams)
+
+    def update(self, x, who=None, metadata=None):
+        if isinstance(x, EndOfInput):
+            self.ended.add(who)
+            return self._maybe_emit() or None
+
+        if who in self.ended:
+            raise ValueError(
+                "Input %d to merge_sorted emitted a chunk after "
+                "end-of-input" % self.upstreams.index(who))
+
+        chunk = list(x)
+        if not chunk:
+            return None
+        self._validate_chunk(who, chunk)
+        self._retain_refs(metadata)
+        self.buffers[who].append((iter(chunk), metadata))
+        self._advance_head(who)
+        results = self._maybe_emit()
+        if len(self.buffers[who]) > self.maxsize:
+            results.append(self.condition.wait())
+        return results or None
+
+    def _validate_chunk(self, upstream, chunk):
+        last = self.last_keys[upstream]
+        for element in chunk:
+            key = self.key(element)
+            if last is not _no_key and key < last:
+                index = self.upstreams.index(upstream)
+                raise ValueError(
+                    "Input %d to merge_sorted is not sorted: "
+                    "key %r was followed by smaller key %r"
+                    % (index, last, key))
+            last = key
+        self.last_keys[upstream] = last
+
+    def _advance_head(self, upstream):
+        if self.heads[upstream] is not _no_head:
+            return
+        buffer = self.buffers[upstream]
+        while buffer:
+            iterator, metadata = buffer[0]
+            try:
+                element = next(iterator)
+            except StopIteration:
+                buffer.popleft()
+                self._release_refs(metadata)
+                self.condition.notify_all()
+            else:
+                self.heads[upstream] = (self.key(element), element, metadata)
+                return
+
+    def _maybe_emit(self):
+        results = []
+        while True:
+            best = None
+            for index, upstream in enumerate(self.upstreams):
+                head = self.heads[upstream]
+                if head is _no_head:
+                    if upstream not in self.ended:
+                        return results  # wait for more input
+                    continue
+                if best is None or head[0] < best[0]:
+                    best = (head[0], index, upstream)
+            if best is None:
+                return results
+            _, _, upstream = best
+            _, element, metadata = self.heads[upstream]
+            self.heads[upstream] = _no_head
+            results.extend(self._emit(element, metadata=metadata))
+            self._advance_head(upstream)
+
+
 @Stream.register_api()
 class combine_latest(Stream):
     """ Combine multiple streams together to a stream of tuples

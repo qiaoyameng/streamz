@@ -862,6 +862,181 @@ def test_zip_metadata():
     ]
 
 
+def test_merge_sorted():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    L = m.sink_to_list()
+
+    a.emit([1, 5, 9])
+    assert L == []  # waits: b has no head element yet
+
+    b.emit([3])
+    assert L == [1, 3]
+
+    b.emit(sz.END_OF_INPUT)  # last chunk on b is the end-of-input signal
+    assert L == [1, 3, 5, 9]
+
+    a.emit(sz.END_OF_INPUT)
+    assert L == [1, 3, 5, 9]
+
+
+def test_merge_sorted_method():
+    a = Stream()
+    b = Stream()
+    L = a.merge_sorted(b).sink_to_list()
+
+    a.emit([2])
+    b.emit([1])
+    b.emit(sz.END_OF_INPUT)
+    a.emit(sz.END_OF_INPUT)
+
+    assert L == [1, 2]
+
+
+def test_merge_sorted_empty_input():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    L = m.sink_to_list()
+
+    b.emit(sz.END_OF_INPUT)  # empty input: ends without any chunk
+    a.emit([])  # empty chunks are ignored
+    a.emit([1, 3])
+    a.emit([4])
+    a.emit(sz.END_OF_INPUT)
+
+    assert L == [1, 3, 4]
+
+
+@gen_test()
+def test_merge_sorted_slow_input():
+    a = Stream(asynchronous=True)
+    b = Stream(asynchronous=True)
+    m = sz.merge_sorted(a, b)
+    L = m.sink_to_list()
+
+    yield a.emit([1, 10, 20])
+    yield gen.sleep(0.05)
+    assert L == []  # nothing emitted: b may still produce smaller elements
+
+    yield b.emit([5])
+    assert L == [1, 5]
+
+    yield gen.sleep(0.05)
+    assert L == [1, 5]  # 10 and 20 are held back until b ends
+
+    yield b.emit(sz.END_OF_INPUT)
+    assert L == [1, 5, 10, 20]
+
+    yield a.emit(sz.END_OF_INPUT)
+    assert L == [1, 5, 10, 20]
+
+
+def test_merge_sorted_duplicate_keys():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b, key=lambda x: x[0])
+    L = m.sink_to_list()
+
+    a.emit([(1, 'a0'), (1, 'a1'), (2, 'a2')])
+    b.emit([(1, 'b0'), (1, 'b1')])
+    b.emit(sz.END_OF_INPUT)
+    a.emit(sz.END_OF_INPUT)
+
+    # equal keys: input 0 first, each input in its original order
+    assert L == [(1, 'a0'), (1, 'a1'), (1, 'b0'), (1, 'b1'), (2, 'a2')]
+
+
+def test_merge_sorted_out_of_order():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    m.sink_to_list()
+
+    a.emit([1, 3])
+    with pytest.raises(ValueError) as excinfo:
+        a.emit([2])
+    assert "Input 0" in str(excinfo.value)
+    assert "3" in str(excinfo.value)
+    assert "2" in str(excinfo.value)
+
+    with pytest.raises(ValueError) as excinfo:
+        b.emit([5, 4])
+    assert "Input 1" in str(excinfo.value)
+    assert "5" in str(excinfo.value)
+    assert "4" in str(excinfo.value)
+
+
+def test_merge_sorted_chunk_after_end():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    m.sink_to_list()
+
+    a.emit(sz.END_OF_INPUT)
+    with pytest.raises(ValueError):
+        a.emit([1])
+
+
+@gen_test()
+def test_merge_sorted_backpressure():
+    a = Stream(asynchronous=True)
+    b = Stream(asynchronous=True)
+    m = sz.merge_sorted(a, b, maxsize=1)
+    L = m.sink_to_list()
+
+    yield a.emit([1])
+    future = a.emit([2])  # two pending chunks on a: exceeds maxsize
+    with pytest.raises(gen.TimeoutError):
+        yield gen.with_timeout(timedelta(seconds=0.02), future)
+
+    yield b.emit([0])
+    yield b.emit(sz.END_OF_INPUT)  # drains a's chunks, releasing backpressure
+    yield future
+    yield a.emit(sz.END_OF_INPUT)
+
+    assert L == [0, 1, 2]
+
+
+def test_merge_sorted_ref_counts():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    m.sink_to_list()
+
+    ref1 = RefCounter()
+    a.emit([1, 3], metadata=[{'ref': ref1}])
+    assert ref1.count == 1
+
+    ref2 = RefCounter()
+    b.emit([2], metadata=[{'ref': ref2}])
+    assert ref2.count == 0  # chunk fully consumed and released
+    assert ref1.count == 1  # element 3 is still buffered
+
+    b.emit(sz.END_OF_INPUT)
+    assert ref1.count == 0
+
+
+def test_merge_sorted_destroy_releases_metadata():
+    a = Stream()
+    b = Stream()
+    m = sz.merge_sorted(a, b)
+    m.sink_to_list()
+
+    ref1 = RefCounter()
+    a.emit([1, 2], metadata=[{'ref': ref1}])
+    assert ref1.count == 1
+
+    ref2 = RefCounter()
+    a.emit([3, 4], metadata=[{'ref': ref2}])
+    assert ref2.count == 1
+
+    m.destroy()
+    assert ref1.count == 0
+    assert ref2.count == 0
+
+
 def test_frequencies():
     source = Stream()
     L = source.frequencies().sink_to_list()

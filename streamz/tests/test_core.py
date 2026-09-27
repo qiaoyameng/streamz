@@ -802,6 +802,237 @@ def test_combine_latest_metadata():
     ]
 
 
+def order(oid, ts):
+    return {'order_id': oid, 'ts': ts, 'kind': 'order'}
+
+
+def payment(oid, ts):
+    return {'order_id': oid, 'ts': ts, 'kind': 'payment'}
+
+
+def test_interval_join_inner():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=10)
+    L = joined.sink_to_list()
+
+    o1 = order('a', 100)
+    p1 = payment('a', 95)    # lower bound, inclusive
+    p2 = payment('a', 110)   # upper bound, inclusive
+    p3 = payment('a', 94)    # just outside the interval
+    p4 = payment('a', 111)   # just outside the interval
+    p5 = payment('b', 100)   # different key
+
+    payments.emit(p1)        # payment first: buffered, nothing to match yet
+    assert L == []
+
+    orders.emit(o1)          # matches the buffered payment
+    assert L == [(o1, p1)]
+
+    payments.emit(p2)
+    payments.emit(p3)
+    payments.emit(p4)
+    payments.emit(p5)
+    assert L == [(o1, p1), (o1, p2)]
+
+
+def test_interval_join_out_of_order_and_one_to_many():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=5)
+    L = joined.sink_to_list()
+
+    o1 = order('a', 100)
+    o2 = order('a', 103)
+    p1 = payment('a', 102)   # matches both orders
+    p2 = payment('a', 98)    # matches both orders
+
+    # both sides arrive out of order relative to each other
+    payments.emit(p2)
+    orders.emit(o2)
+    payments.emit(p1)
+    orders.emit(o1)          # event time goes backwards on the order side
+
+    assert L == [(o2, p2), (o2, p1), (o1, p2), (o1, p1)]
+
+
+def test_interval_join_left_unmatched_timing():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=10, how='left')
+    L = joined.sink_to_list()
+
+    o1 = order('a', 100)
+    orders.emit(o1)
+    # no output yet: a future payment with ts <= 110 could still match
+    assert L == []
+
+    payments.emit(payment('b', 109))
+    assert L == []           # right watermark 109 <= 110: still undecided
+
+    payments.emit(payment('b', 110))
+    assert L == []           # watermark exactly at the deadline: still open
+
+    payments.emit(payment('b', 111))
+    # right watermark 111 > 100 + 10 proves o1 can never match
+    assert L == [(o1, None)]
+
+    # a late payment for the same key arrives after reclamation: no output
+    payments.emit(payment('a', 105))
+    assert L == [(o1, None)]
+
+
+def test_interval_join_left_matched_then_watermark():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=10, how='left')
+    L = joined.sink_to_list()
+
+    o1 = order('a', 100)
+    o2 = order('b', 100)
+    p1 = payment('a', 105)
+
+    orders.emit(o1)
+    orders.emit(o2)
+    payments.emit(p1)
+    assert L == [(o1, p1)]
+
+    # pushing the right watermark past both deadlines only pads the
+    # unmatched order; the matched one is not emitted again
+    payments.emit(payment('c', 1000))
+    assert L == [(o1, p1), (o2, None)]
+    assert not joined.left_state
+
+
+def test_interval_join_left_late_order():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=10, how='left')
+    L = joined.sink_to_list()
+
+    payments.emit(payment('a', 200))   # right watermark is now 200
+
+    o1 = order('b', 100)               # late: 100 + 10 < 200
+    orders.emit(o1)
+    # the right watermark already proves no match is possible: pad now
+    assert L == [(o1, None)]
+    assert not joined.left_state
+
+
+def test_interval_join_inner_late_records():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=10)
+    L = joined.sink_to_list()
+
+    o1 = order('a', 100)
+    orders.emit(o1)
+    payments.emit(payment('b', 500))   # right watermark jumps to 500
+    assert not joined.left_state       # o1 reclaimed, no padding in inner mode
+    assert L == []
+
+    # late payment that would have matched o1 finds no state: no output
+    payments.emit(payment('a', 100))
+    assert L == []
+
+    # late order still matches payments that remain buffered
+    p2 = payment('c', 50)
+    o2 = order('c', 55)
+    payments.emit(p2)
+    orders.emit(o2)
+    assert L == [(o2, p2)]
+
+
+def test_interval_join_same_timestamp_state_reclaim():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=-5, upper=5)
+    L = joined.sink_to_list()
+
+    o1 = order('k', 10)
+    o2 = order('k', 10)                # same key, same timestamp
+    p1 = payment('k', 5)               # at the lower bound of both
+
+    orders.emit(o1)
+    orders.emit(o2)
+    payments.emit(p1)
+    assert L == [(o1, p1), (o2, p1)]
+
+    # left watermark is 10; p1 at ts 5 == 10 + lower is retained so that
+    # another order at the same timestamp can still match it
+    o3 = order('k', 10)
+    orders.emit(o3)
+    assert L == [(o1, p1), (o2, p1), (o3, p1)]
+
+    # once the left watermark strictly passes ts 5 + 5 the payment is
+    # reclaimed
+    o4 = order('k', 11)
+    orders.emit(o4)
+    assert dict(joined.right_state) == {}
+
+    # the right watermark reclaims order state independently: o1..o3
+    # expire at ts > 15, o4 at ts > 16
+    payments.emit(payment('k', 16))
+    assert [entry[0] for entry in joined.left_state['k']] == [o4]
+    payments.emit(payment('k', 17))
+    assert dict(joined.left_state) == {}
+
+
+def test_interval_join_callable_and_per_side_accessors():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(
+        payments,
+        left_on=lambda rec: rec['oid'],
+        right_on=lambda rec: rec['oid'],
+        left_time=lambda rec: rec['at'],
+        right_time=lambda rec: rec['at'],
+        lower=0, upper=0)
+    L = joined.sink_to_list()
+
+    o1 = {'oid': 1, 'at': 10}
+    p1 = {'oid': 1, 'at': 10}          # exact timestamp equality
+    p2 = {'oid': 1, 'at': 11}
+    orders.emit(o1)
+    payments.emit(p1)
+    payments.emit(p2)
+    assert L == [(o1, p1)]
+
+
+def test_interval_join_shared_time_accessor():
+    orders = Stream()
+    payments = Stream()
+    joined = orders.interval_join(payments, on='order_id', time='ts',
+                                  lower=0, upper=5)
+    L = joined.sink_to_list()
+
+    o1 = order('a', 10)
+    p1 = payment('a', 15)
+    orders.emit(o1)
+    payments.emit(p1)
+    assert L == [(o1, p1)]
+
+
+def test_interval_join_validation():
+    a = Stream()
+    b = Stream()
+    with pytest.raises(ValueError):
+        a.interval_join(b, time='ts', how='outer')
+    with pytest.raises(ValueError):
+        a.interval_join(b, time='ts', lower=10, upper=5)
+    with pytest.raises(TypeError):
+        a.interval_join(b, on='order_id')
+    with pytest.raises(ValueError):
+        a.interval_join(b, on='a', left_on='b', time='ts')
+
+
 @gen_test()
 def test_zip_timeout():
     a = Stream(asynchronous=True)

@@ -5,6 +5,7 @@ from datetime import timedelta
 from itertools import chain
 import functools
 import logging
+from operator import itemgetter
 import threading
 from time import time
 from typing import Any, Callable, Coroutine, Hashable, Tuple, Union, overload
@@ -1727,6 +1728,211 @@ class combine_latest(Stream):
             tup = tuple(self.last)
             md = [m for ml in self.metadata for m in ml]
             return self._emit(tup, md)
+
+
+def _as_accessor(spec):
+    """ Normalize a key/timestamp specification into a callable accessor """
+    if spec is None:
+        return identity
+    if callable(spec):
+        return spec
+    return itemgetter(spec)
+
+
+@Stream.register_api()
+class interval_join(Stream):
+    """ Join two streams on a key within an event-time interval
+
+    Elements from both streams are grouped by key and joined when their
+    event times fall within a given interval of each other.  A left
+    element with event time ``t_left`` matches a right element with event
+    time ``t_right`` of the same key whenever
+    ``t_left + lower <= t_right <= t_left + upper`` (both bounds are
+    inclusive).  Matching is one-to-many: every matching pair is emitted
+    as a ``(left, right)`` tuple.
+
+    Each side tracks its own watermark, the maximum event time seen so
+    far on that side.  Watermarks of the two sides advance independently
+    and are used to decide when buffered state can no longer participate
+    in a match so it can be reclaimed.  Records arriving out of order or
+    with an event time behind their side's watermark (late records) are
+    still processed and matched against whatever state remains.
+
+    With ``how='left'``, a left element that has not matched anything is
+    emitted as ``(left, None)`` once the right watermark proves that no
+    future right element can match it, i.e. once
+    ``right_watermark > t_left + upper``.
+
+    Parameters
+    ----------
+    other: Stream
+        The right-hand stream
+    on: str, callable, optional
+        Key specification applied to elements of both streams.  A
+        callable is used as-is, anything else is treated as a key/index
+        into the element.  Defaults to the element itself.
+    left_on, right_on: str, callable, optional
+        Per-side key specifications, overriding ``on``
+    time: str, callable, optional
+        Event-time specification applied to elements of both streams
+    left_time, right_time: str, callable
+        Per-side event-time specifications, overriding ``time``.
+        Event times must be provided explicitly; the processing clock is
+        never used.
+    lower, upper: numbers, optional
+        Offsets relative to the left event time defining the inclusive
+        matching interval ``[t_left + lower, t_left + upper]``.  Use a
+        negative ``lower`` to admit right elements earlier than the left
+        element.
+    how: str, optional
+        'inner' (default) or 'left'
+
+    Examples
+    --------
+    >>> orders = Stream()
+    >>> payments = Stream()
+    >>> joined = orders.interval_join(payments, on='order_id',
+    ...                               time='timestamp',
+    ...                               lower=-5, upper=10, how='left')
+    >>> joined.sink(print)
+    """
+    _graphviz_orientation = 270
+    _graphviz_shape = 'triangle'
+
+    def __init__(self, upstream, other, on=None, left_on=None, right_on=None,
+                 time=None, left_time=None, right_time=None,
+                 lower=0, upper=0, how='inner', **kwargs):
+        if how not in ('inner', 'left'):
+            raise ValueError("how must be 'inner' or 'left', got %r" % (how,))
+        if lower > upper:
+            raise ValueError("lower must not exceed upper, got %r > %r"
+                             % (lower, upper))
+        if on is not None:
+            if left_on is not None or right_on is not None:
+                raise ValueError("pass either 'on' or 'left_on'/'right_on', "
+                                 "not both")
+            left_on = right_on = on
+        if time is not None:
+            if left_time is not None or right_time is not None:
+                raise ValueError("pass either 'time' or "
+                                 "'left_time'/'right_time', not both")
+            left_time = right_time = time
+        if left_time is None or right_time is None:
+            raise TypeError("interval_join requires event-time accessors; "
+                            "pass 'time' or both 'left_time' and 'right_time'")
+
+        self.how = how
+        self.lower = lower
+        self.upper = upper
+        self.left_key = _as_accessor(left_on)
+        self.right_key = _as_accessor(right_on)
+        self.left_time = _as_accessor(left_time)
+        self.right_time = _as_accessor(right_time)
+
+        self.left_watermark = None
+        self.right_watermark = None
+        # key -> list of [element, event_time, matched]
+        self.left_state = defaultdict(list)
+        # key -> list of [element, event_time]
+        self.right_state = defaultdict(list)
+
+        self._left_upstream = upstream
+        self._right_upstream = other
+        Stream.__init__(self, upstreams=[upstream, other], **kwargs)
+
+    def update(self, x, who=None, metadata=None):
+        if who is self._left_upstream:
+            out = self._process_left(x)
+        else:
+            out = self._process_right(x)
+        L = []
+        items = chain(out)
+        try:
+            item = next(items)
+        except StopIteration:
+            return L
+        for item_next in items:
+            y = self._emit(item)
+            item = item_next
+            if type(y) is list:
+                L.extend(y)
+            else:
+                L.append(y)
+        y = self._emit(item, metadata=metadata)
+        if type(y) is list:
+            L.extend(y)
+        else:
+            L.append(y)
+        return L
+
+    def _process_left(self, x):
+        t = self.left_time(x)
+        key = self.left_key(x)
+        out = []
+        matched = False
+        for rec, rt in self.right_state.get(key, ()):
+            if t + self.lower <= rt <= t + self.upper:
+                out.append((x, rec))
+                matched = True
+        self.left_state[key].append([x, t, matched])
+        self._advance_left_watermark(t)
+        out.extend(self._expire_left())
+        return out
+
+    def _process_right(self, x):
+        t = self.right_time(x)
+        key = self.right_key(x)
+        out = []
+        for entry in self.left_state.get(key, ()):
+            lt = entry[1]
+            if lt + self.lower <= t <= lt + self.upper:
+                out.append((entry[0], x))
+                entry[2] = True
+        self.right_state[key].append([x, t])
+        self._advance_right_watermark(t)
+        out.extend(self._expire_left())
+        return out
+
+    def _advance_left_watermark(self, t):
+        wm = self.left_watermark
+        self.left_watermark = t if wm is None else max(wm, t)
+        # A right record can still match a future left record only if
+        # rt - lower >= left_watermark; reclaim the rest.
+        limit = self.left_watermark + self.lower
+        for key in list(self.right_state):
+            kept = [entry for entry in self.right_state[key]
+                    if entry[1] >= limit]
+            if kept:
+                self.right_state[key] = kept
+            else:
+                del self.right_state[key]
+
+    def _advance_right_watermark(self, t):
+        wm = self.right_watermark
+        self.right_watermark = t if wm is None else max(wm, t)
+
+    def _expire_left(self):
+        # A left record can still match a future right record only if
+        # lt + upper >= right_watermark.  Expired records are reclaimed;
+        # in 'left' mode unmatched ones are emitted with a null right
+        # side at this point, and only at this point.
+        if self.right_watermark is None:
+            return []
+        wm = self.right_watermark
+        out = []
+        for key in list(self.left_state):
+            kept = []
+            for rec, lt, matched in self.left_state[key]:
+                if lt + self.upper < wm:
+                    if self.how == 'left' and not matched:
+                        out.append((rec, None))
+                else:
+                    kept.append([rec, lt, matched])
+            if kept:
+                self.left_state[key] = kept
+            else:
+                del self.left_state[key]
+        return out
 
 
 @Stream.register_api()

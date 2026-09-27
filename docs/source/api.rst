@@ -21,6 +21,7 @@ Stream
    delay
    filter
    flatten
+   interval_join
    map
    map_async
    partition
@@ -89,6 +90,7 @@ Definitions
 .. autofunction:: delay
 .. autofunction:: filter
 .. autofunction:: flatten
+.. autofunction:: interval_join
 .. autofunction:: map
 .. autofunction:: partition
 .. autofunction:: rate_limit

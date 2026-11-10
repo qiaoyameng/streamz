@@ -65,6 +65,33 @@ from a file
        source.emit(line)
 
 
+Explicit synchronous fusion
+----------------------------
+
+Short ``map``, ``filter`` and ``flatten`` chains can opt in to fusion with
+``fusible=True``. Calling ``Stream.fuse`` leaves the original graph connected
+and returns a new graph plus a plan describing which chains were combined and
+where processing stopped.
+
+.. code-block:: python
+
+   source = Stream()
+   stream = (
+       source
+       .map(increment, fusible=True)
+       .filter(lambda value: value > 0, fusible=True)
+       .flatten(fusible=True)
+   )
+
+   fused = stream.fuse()
+   print(fused.plan.to_dict())
+
+Fusion is limited to exact synchronous ``map``, ``filter`` and ``flatten``
+nodes. Forks, registered sinks, custom ``update`` subclasses, asynchronous
+functions and stateful operators remain boundaries. Shared subgraphs are
+cloned once, not once per downstream branch.
+
+
 Accumulating State
 ------------------
 

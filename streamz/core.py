@@ -641,6 +641,16 @@ class Stream(APIRegisterMixin):
         from .batch import Batch
         return Batch(stream=self, **kwargs)
 
+    def fuse(self):
+        """ Build an equivalent graph with fusible synchronous chains combined.
+
+        Chains are only considered for fusion when their ``map``, ``filter``
+        or ``flatten`` nodes are created with ``fusible=True``. The original
+        graph is left connected and usable.
+        """
+        from .fusion import fuse
+        return fuse(self)
+
     def _retain_refs(self, metadata, n=1):
         """ Retain all references in the provided metadata `n` number of times
 
@@ -704,6 +714,7 @@ class map(Stream):
         self.func = func
         # this is one of a few stream specific kwargs
         stream_name = kwargs.pop('stream_name', None)
+        self.fusible = kwargs.pop('fusible', False)
         self.kwargs = kwargs
         self.args = args
 
@@ -915,6 +926,7 @@ class filter(Stream):
             predicate = _truthy
         self.predicate = predicate
         stream_name = kwargs.pop("stream_name", None)
+        self.fusible = kwargs.pop("fusible", False)
         self.kwargs = kwargs
         self.args = args
 
@@ -1751,6 +1763,14 @@ class flatten(Stream):
     --------
     partition
     """
+    def __init__(self, upstream, **kwargs):
+        stream_name = kwargs.pop('stream_name', None)
+        self.fusible = kwargs.pop('fusible', False)
+        if kwargs:
+            raise TypeError("flatten got an unexpected keyword argument %r"
+                            % next(iter(kwargs)))
+        Stream.__init__(self, upstream, stream_name=stream_name)
+
     def update(self, x, who=None, metadata=None):
         L = []
         items = chain(x)

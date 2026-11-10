@@ -38,6 +38,12 @@ Stream
    zip
    zip_latest
 
+.. autosummary::
+   IterationController
+   IterationResult
+   RoundRecord
+   iterate
+
 .. automethod:: Stream.connect
 .. automethod:: Stream.disconnect
 .. automethod:: Stream.destroy

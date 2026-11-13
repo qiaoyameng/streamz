@@ -65,6 +65,32 @@ from a file
        source.emit(line)
 
 
+Ending a stream
+---------------
+
+Finite sources such as ``Stream.from_iterable`` signal end-of-input when they
+are exhausted.  You can also signal it explicitly with ``Stream.end``.  This is
+an out-of-band control signal rather than a special data value, so ``None`` is
+still ordinary data.
+
+.. code-block:: python
+
+   source = Stream.from_iterable(range(5))
+   source.partition(2).sink(print)
+   source.start()
+   source.completion.result()   # (0, 1), (2, 3), (4)
+
+``end`` and its aliases are idempotent and return the same completion future.
+The future resolves only after stateful nodes flush their final data and all
+downstream processing has finished.  Emitting data after ending raises
+``RuntimeError``.  A processing exception is carried by the completion future
+separately from a normal end.
+
+``partition`` emits any partial final partition, ``collect`` flushes its buffer
+once, and ``zip`` ends as soon as the shortest input ends.  Buffered elements
+that can no longer be paired are released and counted in ``zip.dropped_count``.
+
+
 Accumulating State
 ------------------
 

@@ -55,6 +55,8 @@ class Source(Stream):
         If already running, this has no effect. If the source was started and then
         stopped again, this will restart the ``self.run`` coroutine.
         """
+        if self._end_requested:
+            return
         if self.stopped:
             self.stopped = False
             self.started = True
@@ -786,13 +788,26 @@ class from_iterable(Source):
         super().__init__(**kwargs)
 
     async def run(self):
-        for x in self._iterable:
-            if self.stopped:
-                break
-            await asyncio.gather(*self._emit(x))
-            if self.stopped:
-                break
-        self.stopped = True
+        finished = False
+        try:
+            for x in self._iterable:
+                if self.stopped or self._closed:
+                    break
+                await asyncio.gather(*self._emit(x))
+                if self.stopped or self._closed:
+                    break
+            else:
+                finished = True
+        except Exception as exc:
+            # An exception is terminal, but distinct from normal end-of-input.
+            # Still close the graph so stateful descendants can flush and
+            # completion waiters are not left hanging.
+            self._record_error(exc)
+            finished = True
+        finally:
+            self.stopped = True
+        if finished:
+            self.end()
 
 
 @Stream.register_api()

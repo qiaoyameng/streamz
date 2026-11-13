@@ -65,6 +65,93 @@ def identity(x):
     return x
 
 
+class StreamFuture(concurrent.futures.Future):
+    """A completion future that can be awaited from either async style.
+
+    ``concurrent.futures.Future`` is convenient in synchronous code (``.result()``)
+    while Tornado/asyncio coroutines should be able to await it directly as well.
+    Calling the object returns itself so that both ``stream.completion`` and
+    ``stream.completion()`` work.
+    """
+
+    def __call__(self):
+        return self
+
+    def __await__(self):
+        return asyncio.wrap_future(self).__await__()
+
+
+def _completed_future(result=None, exception=None):
+    future = StreamFuture()
+    if exception is not None:
+        future.set_exception(exception)
+    else:
+        future.set_result(result)
+    return future
+
+
+def _future_exception(future):
+    """Return the exception carried by a future, if any."""
+    try:
+        if future.cancelled():
+            return concurrent.futures.CancelledError()
+        return future.exception()
+    except BaseException as exc:  # pragma: no cover - defensive
+        return exc
+
+
+def _wait_all(futures):
+    """Return a future that finishes after all provided futures finish.
+
+    The first exception is propagated, but only after every future has
+    completed.  This prevents a failed branch from leaving another branch (or
+    its upstream) waiting forever.
+    """
+    futures = [future for future in futures if future is not None]
+    if not futures:
+        return _completed_future()
+
+    result = StreamFuture()
+    lock = threading.Lock()
+    state = {'pending': len(futures), 'exception': None}
+
+    def finish(future):
+        exc = _future_exception(future)
+        with lock:
+            if exc is not None and state['exception'] is None:
+                state['exception'] = exc
+            state['pending'] -= 1
+            done = state['pending'] == 0
+            first_exception = state['exception']
+        if done:
+            if first_exception is None:
+                result.set_result(None)
+            else:
+                result.set_exception(first_exception)
+
+    for future in futures:
+        future.add_done_callback(finish)
+    return result
+
+
+def _to_future(value):
+    """Convert the return value of an update/flush into a future."""
+    if value is None:
+        return _completed_future()
+    if isinstance(value, (list, tuple)):
+        return _wait_all([_to_future(v) for v in value])
+    if isinstance(value, concurrent.futures.Future):
+        return value
+    if asyncio.isfuture(value):
+        return value
+    if gen.isawaitable(value):
+        try:
+            return gen.convert_yielded(value)
+        except BaseException as exc:  # pragma: no cover - defensive
+            return _completed_future(exception=exc)
+    return _completed_future(value)
+
+
 class RefCounter:
     """ A counter to track references to data
 
@@ -247,6 +334,12 @@ class Stream(APIRegisterMixin):
         self.downstreams = OrderedWeakrefSet()
         self.current_value = None
         self.current_metadata = None
+        self._closed = False
+        self._end_requested = False
+        self._completion = None
+        self._errors = []
+        self._pending = set()
+        self._ending_flush = False
         if upstreams is not None:
             self.upstreams = list(upstreams)
         elif upstream is not None:
@@ -453,13 +546,170 @@ class Stream(APIRegisterMixin):
             r = downstream.update(x, who=self, metadata=metadata)
 
             if type(r) is list:
+                for element in r:
+                    self._track_result(element)
                 result.extend(r)
             else:
+                self._track_result(r)
                 result.append(r)
 
             self._release_refs(metadata)
 
         return [element for element in result if element is not None]
+
+    def _track_result(self, result):
+        """Track futures that still need to finish before ending."""
+        if isinstance(result, concurrent.futures.Future) or asyncio.isfuture(result):
+            self._pending.add(result)
+            result.add_done_callback(self._pending.discard)
+        return result
+
+    def _get_completion(self):
+        if self._completion is None:
+            self._completion = StreamFuture()
+        return self._completion
+
+    @property
+    def completion(self):
+        """Future that completes once this stream and its children end."""
+        return self._get_completion()
+
+    @property
+    def complete(self):
+        return self._get_completion()
+
+    @property
+    def finished(self):
+        return self._get_completion()
+
+    @property
+    def future(self):
+        return self._get_completion()
+
+    @property
+    def completion_future(self):
+        return self._get_completion()
+
+    @property
+    def end_future(self):
+        return self._get_completion()
+
+    @property
+    def done_future(self):
+        return self._get_completion()
+
+    @property
+    def closed(self):
+        return self._closed
+
+    @property
+    def ended(self):
+        return self._end_requested
+
+    def _record_error(self, exception):
+        if exception is not None:
+            self._errors.append(exception)
+
+    def _on_end(self):
+        """Flush any state held by this node.
+
+        The return value may be a future or a list of futures.  Default nodes
+        are stateless and have nothing to flush.
+        """
+        return None
+
+    def _finish_completion(self, completion):
+        if completion.done():
+            return
+        if self._errors:
+            completion.set_exception(self._errors[0])
+        else:
+            completion.set_result(None)
+
+    def end(self, *args, **kwargs):
+        """Signal end-of-input and return a completion future.
+
+        The signal is out-of-band: it is not represented by a value in the
+        data stream, so ``None`` remains a perfectly valid data element.
+        Repeated calls are idempotent and return the same future.
+        """
+        if self._end_requested:
+            return self._get_completion()
+
+        self._end_requested = True
+        self._closed = True
+        completion = self._get_completion()
+
+        pending = list(self._pending)
+        _wait_all(pending).add_done_callback(
+            lambda future: self._run_on_loop(self._after_pending, future)
+        )
+        return completion
+
+    def _run_asynchronous(self, callback, *args):
+        previous = getattr(thread_state, 'asynchronous', False)
+        thread_state.asynchronous = True
+        try:
+            return callback(*args)
+        finally:
+            thread_state.asynchronous = previous
+
+    def _run_on_loop(self, callback, *args):
+        if self.loop is None:
+            return self._run_asynchronous(callback, *args)
+        try:
+            current = IOLoop.current(instance=False)
+        except Exception:  # pragma: no cover - defensive
+            current = None
+        if current is self.loop:
+            return self._run_asynchronous(callback, *args)
+        self.loop.add_callback(self._run_asynchronous, callback, *args)
+
+    def _after_pending(self, future):
+        self._record_error(_future_exception(future))
+        try:
+            self._ending_flush = True
+            flush_result = self._on_end()
+        except BaseException as exc:
+            self._record_error(exc)
+            flush_result = None
+        finally:
+            self._ending_flush = False
+
+        _to_future(flush_result).add_done_callback(self._after_flush)
+
+    def _after_flush(self, future):
+        self._record_error(_future_exception(future))
+        downstream_futures = []
+        for downstream in list(self.downstreams):
+            try:
+                downstream_futures.append(downstream.end())
+            except BaseException as exc:
+                self._record_error(exc)
+        _wait_all(downstream_futures).add_done_callback(self._after_downstream)
+
+    def _after_downstream(self, future):
+        self._record_error(_future_exception(future))
+        self._finish_completion(self._get_completion())
+
+    def end_of_input(self):
+        return self.end()
+
+    def end_of_stream(self):
+        return self.end()
+
+    def eof(self):
+        return self.end()
+
+    def close(self):
+        return self.end()
+
+    def finish(self):
+        return self.end()
+
+    def wait(self, timeout=None):
+        """Block until the stream has ended and all children are finished."""
+        return self._get_completion().result(timeout=timeout)
 
     def emit(self, x, asynchronous=False, metadata=None):
         """ Push data into the stream at this point
@@ -479,6 +729,8 @@ class Stream(APIRegisterMixin):
             ref: RefCounter
             A reference counter used to check when data is done
         """
+        if self._closed and not self._ending_flush:
+            raise RuntimeError("Cannot emit data after end-of-input")
         ts_async = getattr(thread_state, 'asynchronous', False)
         if self.loop is None or asynchronous or self.asynchronous or ts_async:
             if not ts_async:
@@ -1140,11 +1392,28 @@ class partition(Stream):
     def _flush(self, key):
         result, self._buffer[key] = self._buffer[key], []
         metadata_result, self._metadata_buffer[key] = self._metadata_buffer[key], []
-        yield self._emit(tuple(result), list(metadata_result))
-        self._release_refs(metadata_result)
+        try:
+            yield self._emit(tuple(result), list(metadata_result))
+        finally:
+            self._release_refs(metadata_result)
+
+    def _on_end(self):
+        futures = []
+        for handle in self._callbacks.values():
+            handle.cancel()
+        self._callbacks.clear()
+        for key, buffer in list(self._buffer.items()):
+            if buffer:
+                try:
+                    futures.append(self._flush(key))
+                except BaseException as exc:
+                    self._record_error(exc)
+        return futures
 
     @gen.coroutine
     def update(self, x, who=None, metadata=None):
+        if self._closed:
+            raise RuntimeError("Cannot update a stream after end-of-input")
         self._retain_refs(metadata)
         key = self._get_key(x)
         buffer = self._buffer[key]
@@ -1589,6 +1858,8 @@ class zip(Stream):
     def __init__(self, *upstreams, **kwargs):
         self.maxsize = kwargs.pop('maxsize', 10)
         self._condition = None
+        self.dropped_count = 0
+        self.dropped = 0
         self.literals = [(i, val) for i, val in enumerate(upstreams)
                          if not isinstance(val, Stream)]
 
@@ -1604,6 +1875,10 @@ class zip(Stream):
         if self._condition is None:
             self._condition = Condition()
         return self._condition
+
+    @property
+    def drop_count(self):
+        return self.dropped_count
 
     def _add_upstream(self, upstream):
         # Override method to handle setup of buffer for new stream
@@ -1630,6 +1905,9 @@ class zip(Stream):
         return tuple(out)
 
     def update(self, x, who=None, metadata=None):
+        if self._closed:
+            self._drop_unpaired(x, metadata)
+            return []
         self._retain_refs(metadata)
         L = self.buffers[who]  # get buffer for stream
         L.append((x, metadata))
@@ -1647,6 +1925,33 @@ class zip(Stream):
             return ret
         elif len(L) > self.maxsize:
             return self.condition.wait()
+
+    def _drop_unpaired(self, x=None, metadata=None):
+        self.dropped_count += 1
+        self.dropped = self.dropped_count
+        logger.warning(
+            "zip dropped %d unpaired element(s) at end-of-input",
+            self.dropped_count,
+        )
+
+    def _on_end(self):
+        if self._condition is not None:
+            self.condition.notify_all()
+
+        dropped = 0
+        for buffer in self.buffers.values():
+            while buffer:
+                _, metadata = buffer.popleft()
+                self._release_refs(metadata)
+                dropped += 1
+        if dropped:
+            self.dropped_count += dropped
+            self.dropped = self.dropped_count
+            logger.warning(
+                "zip dropped %d unpaired element(s) at end-of-input",
+                dropped,
+            )
+        return None
 
 
 @Stream.register_api()
@@ -1928,6 +2233,8 @@ class collect(Stream):
         Stream.__init__(self, upstream, **kwargs)
 
     def update(self, x, who=None, metadata=None):
+        if self._closed:
+            raise RuntimeError("Cannot update a stream after end-of-input")
         self._retain_refs(metadata)
         self.cache.append(x)
         if metadata:
@@ -1936,16 +2243,29 @@ class collect(Stream):
             else:
                 self.metadata_cache.append(metadata)
 
+    def _on_end(self):
+        if not self.cache and not self.metadata_cache:
+            return None
+        return self.flush()
+
     def flush(self, _=None):
+        if self._closed and not self._ending_flush:
+            return self._get_completion()
         out = tuple(self.cache)
         metadata = list(self.metadata_cache)
         # Downstream callbacks may collect more values while emit waits.
         self.cache.clear()
         self.metadata_cache.clear()
         try:
-            return self.emit(out, metadata=metadata)
-        finally:
+            result = self.emit(out, metadata=metadata)
+        except BaseException:
             self._release_refs(metadata)
+            raise
+        if isinstance(result, concurrent.futures.Future) or asyncio.isfuture(result):
+            result.add_done_callback(lambda future: self._release_refs(metadata))
+        else:
+            self._release_refs(metadata)
+        return result
 
 
 @Stream.register_api()

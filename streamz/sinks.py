@@ -66,6 +66,8 @@ class sink(Sink):
         super().__init__(upstream, **stream_kwargs)
 
     def update(self, x, who=None, metadata=None):
+        if self._closed:
+            raise RuntimeError("Cannot update a stream after end-of-input")
         result = self.func(x, *self.args, **self.kwargs)
         if gen.isawaitable(result):
             return result
